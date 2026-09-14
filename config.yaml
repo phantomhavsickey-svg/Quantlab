@@ -1,0 +1,87 @@
+# ============================================================
+# QuantLab 配置文件
+# ============================================================
+
+# --- 市场参数 ---
+market:
+  stamp_tax_rate: 0.0005      # 印花税 0.05%（仅卖出，2023年8月起）
+  commission_rate: 0.0003     # 佣金 0.03%（万三）
+  min_commission: 5.0         # 最低佣金（元）
+  slippage_rate: 0.001        # 滑点 0.1%
+  lot_size: 100               # 一手 = 100 股
+  t_plus_1: true              # T+1 交收
+
+# --- 股票池 ---
+universe:
+  indices: ["000852"]         # 指数代码：000852=中证1000, 932000=中证2000, 000905=中证500, 000300=沪深300
+  exclude_st: true            # 剔除 ST
+  min_listed_days: 60         # 剔除上市不足60天的新股（次新股波动大）
+
+# --- 因子 ---
+factors:
+  technical:
+    momentum_periods: [5, 10, 20, 60, 120]
+    volatility_periods: [10, 20, 60]
+    volume_ratio_periods: [5, 20]
+    rsi_period: 14
+  fundamental:
+    use_spot_data: false      # 实时快照平铺到历史日期=未来函数，默认关闭（回测会高估收益）
+    use_financial_data: false # 从财报获取 ROE 等（较慢）
+  processing:
+    winsorize_limits: [0.01, 0.99]
+    normalize_method: "zscore"  # zscore / rank
+    neutralize: false           # Barra 风格中性化（需要行业分类）
+
+# --- 模型 ---
+model:
+  type: "regressor"           # regressor（收益率回归）/ classifier（涨跌分类）
+  horizon: 20                 # 预测未来 N 日收益
+  params:
+    objective: "regression"
+    metric: "rmse"
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    min_data_in_leaf: 100
+    lambda_l1: 0.1
+    lambda_l2: 1.0
+    verbose: -1
+  tuning:
+    enabled: false
+    n_trials: 50
+  walk_forward:
+    min_train_months: 24      # 首个预测窗口前的最短训练期（月）
+    retrain_months: 6         # 每 N 个月滚动重训一次
+
+# --- 回测 ---
+backtest:
+  initial_capital: 1000000    # 初始资金 100万
+  rebalance_frequency: "monthly"  # daily / weekly / monthly
+  max_positions: 50           # 最大持仓数
+  position_sizing: "equal_weight"  # equal_weight / inverse_volatility / signal_strength
+  benchmark: "000852"         # 基准指数
+
+# --- 实盘/每日批处理 ---
+live:
+  broker: "simulate"          # simulate（模拟撮合）/ qmt（真实柜台）/ none（仅输出指令文件）
+  order_dir: "live/output"    # 调仓指令文件输出目录
+  state_dir: "live/state"     # 持仓状态持久化目录
+  lookback_days: 250          # 信号计算回看交易日数
+  qmt:
+    mini_qmt_path: ""         # miniQMT 用户数据目录，如 D:\国金QMT\userdata_mini
+    account_id: ""            # 资金账号
+
+# --- 缓存 ---
+cache:
+  directory: "data/cache"
+  max_age_daily: 1            # 日线缓存有效期（天）
+  max_age_fundamentals: 90    # 基本面缓存有效期（天）
+
+# --- 日志 ---
+logging:
+  level: "INFO"
+  file: "logs/quantlab.log"
+  rotation: "10 MB"
+  retention: "30 days"

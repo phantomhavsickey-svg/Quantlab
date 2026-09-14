@@ -1,0 +1,26 @@
+# --- 生成物：全部可由 main.py 重建 ---
+data/cache/
+models/saved/
+reports/
+logs/
+signals/
+
+# --- 实盘/模拟盘落盘：真实持仓与委托记录，禁止上传 ---
+live/output/
+portfolio_state.json
+*.token
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# --- 训练日志 ---
+*.log
