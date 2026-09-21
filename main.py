@@ -430,18 +430,7 @@ def cmd_backtest(args):
         trainer = LightGBMTrainer(model_type=config["model"]["type"])
         trainer.load(model_path)
 
-    # 生成信号
-    predictor = Predictor(
-        trainer,
-        top_k=cfg_backtest["max_positions"],
-        position_sizing=cfg_backtest["position_sizing"],
-    )
-    if trainer is None:
-        signals = predictor.generate_signals_from_series(predictions)
-    else:
-        signals = predictor.generate_signals(feature_matrix)
-
-    # 加载日线
+    # 加载日线(先加载再选股:可交易掩码要知道信号日有没有成交)
     cache = CacheManager(config["cache"]["directory"])
     symbols = factor_panel["symbol"].unique().tolist()
     data_dict = {}
@@ -450,6 +439,23 @@ def cmd_backtest(args):
         if df is not None:
             df["日期"] = pd.to_datetime(df["日期"])
             data_dict[sym] = df
+
+    # 生成信号(信号日已停牌/无成交的股票不占 Top-K 名额)
+    from utils.market_rules import build_tradable_mask
+    predictor = Predictor(
+        trainer,
+        top_k=cfg_backtest["max_positions"],
+        position_sizing=cfg_backtest["position_sizing"],
+    )
+    tradable = build_tradable_mask(
+        data_dict,
+        feature_matrix.index.get_level_values("date").unique())
+    if trainer is None:
+        signals = predictor.generate_signals_from_series(
+            predictions, tradable=tradable)
+    else:
+        signals = predictor.generate_signals(feature_matrix,
+                                            tradable=tradable)
 
     # 成本模型
     cost = TransactionCostModel(
@@ -592,11 +598,18 @@ def cmd_paper_trade(args):
         position_sizing=cfg_backtest["position_sizing"],
     )
 
-    # ---- 生成全时段信号 ----
+    # ---- 生成全时段信号（信号日已停牌/无成交的股票不占 Top-K 名额）----
+    from utils.market_rules import at_limit_down, at_limit_up
+    from utils.market_rules import build_tradable_mask
+    from live.orders import make_orders
+    tradable = build_tradable_mask(
+        data_dict, feature_matrix.index.get_level_values("date").unique())
     if trainer is None:
-        all_signals = predictor.generate_signals_from_series(predictions)
+        all_signals = predictor.generate_signals_from_series(
+            predictions, tradable=tradable)
     else:
-        all_signals = predictor.generate_signals(feature_matrix)
+        all_signals = predictor.generate_signals(feature_matrix,
+                                                tradable=tradable)
 
     # ---- 按日期模拟真实交易 ----
     all_dates = sorted(factor_panel["date"].unique())
@@ -644,8 +657,8 @@ def cmd_paper_trade(args):
                     "low": float(row["最低"]),
                     "close": float(row["收盘"]),
                     "volume": float(row["成交量"]),
-                    "at_limit_up": float(row.get("涨跌幅", 0)) >= 9.5,
-                    "at_limit_down": float(row.get("涨跌幅", 0)) <= -9.5,
+                    "at_limit_up": at_limit_up(sym, row.get("涨跌幅")),
+                    "at_limit_down": at_limit_down(sym, row.get("涨跌幅")),
                 }
 
         # 执行撮合
@@ -663,23 +676,17 @@ def cmd_paper_trade(args):
                 day_signals = all_signals[all_signals.index.get_level_values("date") == rebal_ts]
 
             target = day_signals[day_signals["weight"] > 0]
-            target_symbols = set(target.index)
 
-            # 卖：不在目标中的持仓
-            for sym, pos in list(broker.positions.items()):
-                if sym not in target_symbols and pos.available_shares > 0:
-                    broker.place_market_order(sym, "sell", pos.available_shares)
-
-            # 买：目标持仓
-            cash_per_stock = broker.cash / max(len(target_symbols), 1)
-            for sym in target_symbols:
-                if sym in market_snapshot:
-                    price = market_snapshot[sym]["open"]
-                    shares = broker.lot_size * (
-                        int(cash_per_stock / price) // broker.lot_size
-                    )
-                    if shares >= broker.lot_size:
-                        broker.place_market_order(sym, "buy", shares)
+            # 卖旧买新:下"目标市值 - 现有市值"的差额(与回测共用 utils/sizing)
+            ref_price = {s: v["open"] for s, v in market_snapshot.items()
+                         if v["open"] > 0}
+            orders = make_orders(
+                dict(target["weight"]), broker.positions, broker.cash,
+                ref_price, lot_size=broker.lot_size,
+                fee_rate_buy=cfg_market["commission_rate"]
+                + cfg_market["slippage_rate"])
+            for o in orders:
+                broker.place_market_order(o["symbol"], o["side"], o["quantity"])
 
         # ---- 每日快照（每月记录一次） ----
         portfolio.update(exec_date, broker)

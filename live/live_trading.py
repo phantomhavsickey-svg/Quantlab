@@ -37,6 +37,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from live import SinaQuoteFeed, QuoteMonitor
+from live.orders import make_orders
 from data.cache import CacheManager
 from models.trainer import LightGBMTrainer
 from models.predictor import Predictor
@@ -45,6 +46,7 @@ from paper_trade.portfolio import PortfolioTracker
 from paper_trade.journal import TradeJournal
 from factors.technical import TechnicalFactors
 from utils.logger import setup_logger
+from utils.market_rules import at_limit_down, at_limit_up
 
 
 class LiveTradingEngine:
@@ -193,23 +195,19 @@ class LiveTradingEngine:
             logger.info("今日无选中股票，跳过调仓")
             return
 
-        # 3. 卖出不在目标中的持仓
-        for sym, pos in list(self.broker.positions.items()):
-            if sym not in target_symbols and pos.available_shares > 0:
-                self.broker.place_market_order(sym, "sell", pos.available_shares)
-                logger.info(f"  卖出: {sym} x{pos.available_shares}")
-
-        # 4. 买入目标
-        buy_capital = self.broker.cash / max(len(target_symbols), 1)
-        for sym in target_symbols:
-            if sym in self.quotes_cache:
-                price = self.quotes_cache[sym].price
-                shares = self.broker.lot_size * (
-                    int(buy_capital / price) // self.broker.lot_size
-                )
-                if shares >= self.broker.lot_size:
-                    self.broker.place_market_order(sym, "buy", shares)
-                    logger.info(f"  买入: {sym} x{shares} @ {price:.2f}")
+        # 3. 生成指令并下单：目标市值 - 现有市值 的差额(与回测共用 utils/sizing)
+        ref_price = {s: q.price for s, q in self.quotes_cache.items()
+                     if getattr(q, "price", 0.0)}
+        orders = make_orders(
+            dict(target["weight"]), self.broker.positions, self.broker.cash,
+            ref_price, lot_size=self.broker.lot_size,
+            fee_rate_buy=self.broker.commission_rate
+            + self.broker.slippage_rate)
+        for o in orders:
+            self.broker.place_market_order(o["symbol"], o["side"],
+                                           o["quantity"])
+            logger.info(f"  {o['side']}: {o['symbol']} x{o['quantity']}"
+                        f" @ {o['ref_price']:.2f}")
 
         self.last_rebalance_date = today
         logger.info(f"调仓完成: 目标 {len(target_symbols)} 只, "
@@ -306,8 +304,8 @@ class LiveTradingEngine:
                             "low": q.low,
                             "close": q.price,
                             "volume": q.volume,
-                            "at_limit_up": q.change_pct >= 9.5,
-                            "at_limit_down": q.change_pct <= -9.5,
+                            "at_limit_up": at_limit_up(sym, q.change_pct),
+                            "at_limit_down": at_limit_down(sym, q.change_pct),
                         }
                         for sym, q in quotes.items()
                     }

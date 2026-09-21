@@ -22,6 +22,7 @@ from loguru import logger
 from data.cache import CacheManager
 from factors.technical import TechnicalFactors
 from factors.processor import FactorProcessor
+from live.orders import make_orders as _make_orders
 from models.trainer import LightGBMTrainer
 
 
@@ -123,7 +124,7 @@ class DailySignalGenerator:
     def make_orders(self, weights: pd.Series,
                     positions: dict, cash: float,
                     ref_price: dict) -> list[dict]:
-        """对比当前持仓生成买卖指令。
+        """对比当前持仓生成买卖指令(委托给 live.orders,与回测同一份算式)。
 
         Args:
             weights: 目标组合（symbol -> weight）
@@ -134,33 +135,12 @@ class DailySignalGenerator:
         Returns:
             [{"symbol", "side", "quantity", "ref_price"}]
         """
-        target_symbols = set(weights.index)
-        orders = []
-
-        # 卖出：持仓中不在目标组合的（含全部可用股数）
-        for sym, shares in positions.items():
-            if sym not in target_symbols and shares > 0:
-                orders.append({
-                    "symbol": sym, "side": "sell",
-                    "quantity": int(shares),
-                    "ref_price": ref_price.get(sym, 0.0),
-                })
-
-        # 买入：目标组合（等权近似；已持有的也按目标股数对齐）
-        cash_per = cash / max(len(target_symbols), 1)
-        lot_size = self.config["market"].get("lot_size", 100)
-        for sym in target_symbols:
-            price = ref_price.get(sym, 0.0)
-            if price <= 0:
-                continue
-            shares = lot_size * (int(cash_per / price) // lot_size)
-            if shares <= 0:
-                continue
-            orders.append({
-                "symbol": sym, "side": "buy",
-                "quantity": int(shares), "ref_price": price,
-            })
-        return orders
+        cfg_market = self.config.get("market", {})
+        return _make_orders(
+            weights, positions, cash, ref_price,
+            lot_size=cfg_market.get("lot_size", 100),
+            fee_rate_buy=float(cfg_market.get("commission_rate", 0.0))
+            + float(cfg_market.get("slippage_rate", 0.0)))
 
     def export_target(self, weights: pd.Series, path: str):
         """输出目标组合 CSV。"""

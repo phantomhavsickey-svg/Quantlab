@@ -25,6 +25,9 @@ pyyaml>=6.0
 # 交易日历
 cn-stock-holidays>=2.0
 
+# 实时行情 (live 模块: 新浪 HTTP 接口, 模块级 import)
+requests>=2.31
+
 # 可视化
 plotly>=5.0
 matplotlib>=3.7

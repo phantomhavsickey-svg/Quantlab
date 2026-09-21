@@ -7,6 +7,18 @@ import numpy as np
 from loguru import logger
 
 
+def _normalize_multiindex(mi: pd.MultiIndex) -> pd.MultiIndex:
+    """规范化 MultiIndex 层级：date → datetime64[ns]，symbol → object。
+
+    不同来源构造的 MultiIndex 层级 dtype 可能不一致（str vs object、
+    datetime64[s] vs datetime64[ns] vs object-of-Timestamp），混用时 `xs`
+    会静默失配 —— 过滤条件看着加了，实际一条都没生效。
+    """
+    dates = pd.to_datetime(mi.get_level_values(0)).astype("datetime64[ns]")
+    syms = mi.get_level_values(1).astype(str).astype(object)
+    return pd.MultiIndex.from_arrays([dates, syms], names=mi.names)
+
+
 class Predictor:
     """将模型预测转化为交易信号。
 
@@ -67,11 +79,21 @@ class Predictor:
 
         Args:
             predictions: 预测值 Series (MultiIndex: date x symbol)
-            tradable: 可交易性布尔 Series（同索引），True=可交易
+            tradable: 可交易性布尔 Series (MultiIndex: date x symbol，只含 True
+                      项，缺席即不可选)。口径必须是**信号日当天已知**的信息（当日
+                      有没有成交），不能塞成交日的涨跌停状态 —— 那是未来函数。
+                      任何"识别到某种状态才允许买入"的门控都从这里进。
 
         Returns:
             Series (MultiIndex: date x symbol)，值为持仓权重
         """
+        if isinstance(predictions.index, pd.MultiIndex):
+            predictions = predictions.copy()
+            predictions.index = _normalize_multiindex(predictions.index)
+        if tradable is not None and isinstance(tradable.index, pd.MultiIndex):
+            tradable = tradable.copy()
+            tradable.index = _normalize_multiindex(tradable.index)
+
         if isinstance(predictions.index, pd.MultiIndex):
             dates = predictions.index.get_level_values("date").unique()
         else:
@@ -95,6 +117,10 @@ class Predictor:
                     day_tradable = tradable.xs(d, level="date")
                 else:
                     day_tradable = tradable.loc[tradable.index.get_level_values("date") == d]
+                # 掩码可以只含 True 项（缺席即不可选，build_tradable_mask 就是这样），
+                # 也可以是全量 bool 序列；reindex 之后两种都按"缺席=False"处理
+                day_tradable = day_tradable.reindex(day_preds.index) \
+                    .fillna(False).astype(bool)
                 day_preds = day_preds[day_tradable]
 
             if day_preds.empty:
@@ -178,6 +204,15 @@ class Predictor:
     def _signals_from_predictions(self, predictions: pd.Series,
                                   tradable: pd.Series | None = None
                                   ) -> pd.DataFrame:
+        # 排名/选股/合并三步必须用同一份索引 dtype,否则第 3 步的 reindex
+        # 会静默失配,权重整列变 0
+        if isinstance(predictions.index, pd.MultiIndex):
+            predictions = predictions.copy()
+            predictions.index = _normalize_multiindex(predictions.index)
+        if tradable is not None and isinstance(tradable.index, pd.MultiIndex):
+            tradable = tradable.copy()
+            tradable.index = _normalize_multiindex(tradable.index)
+
         # 1. 排名
         rankings = self.rank_predictions(predictions)
 

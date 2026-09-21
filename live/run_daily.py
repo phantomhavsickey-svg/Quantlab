@@ -27,6 +27,7 @@ from loguru import logger
 
 from utils.logger import setup_logger
 from utils.calendar import is_trading_day, get_month_end_trading_days
+from utils.market_rules import at_limit_down, at_limit_up
 from data.cache import CacheManager
 from data.downloader import DataDownloader
 from paper_trade.broker import SimulatedBroker
@@ -115,8 +116,8 @@ def main():
             "low": float(last["最低"]),
             "close": float(last["收盘"]),
             "volume": float(last["成交量"]),
-            "at_limit_up": float(last.get("涨跌幅", 0) or 0) >= 9.5,
-            "at_limit_down": float(last.get("涨跌幅", 0) or 0) <= -9.5,
+            "at_limit_up": at_limit_up(sym, last.get("涨跌幅")),
+            "at_limit_down": at_limit_down(sym, last.get("涨跌幅")),
         }
 
     # ---- 5. 执行 ----

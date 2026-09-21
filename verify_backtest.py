@@ -29,7 +29,12 @@ for s in symbols:
 
 pred = Predictor(trainer=None, top_k=cb["max_positions"],
                  position_sizing=cb["position_sizing"])
-signals = pred.generate_signals_from_series(predictions)
+# 与 main.py backtest 同口径:信号日无成交/已停牌的不占 Top-K 名额
+from utils.market_rules import build_tradable_mask
+signals = pred.generate_signals_from_series(
+    predictions,
+    tradable=build_tradable_mask(
+        data_dict, predictions.index.get_level_values("date").unique()))
 
 cost = TransactionCostModel(
     commission_rate=cm["commission_rate"],
@@ -60,6 +65,7 @@ trades = result["trades"]
 eq = result["equity_curve"]
 
 lines = []
+lines.append("引擎口径: 2026-09-21 执行层修复后(差额建仓/无前视盯市/可交易性约束)")
 lines.append("回测区间: %s ~ %s" % (eq.index.min().date(), eq.index.max().date()))
 lines.append("交易日数: %d" % len(eq))
 lines.append("")
