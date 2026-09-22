@@ -32,9 +32,11 @@ pred = Predictor(trainer=None, top_k=cb["max_positions"],
 # 与 main.py backtest 同口径:信号日无成交/已停牌的不占 Top-K 名额
 from utils.market_rules import build_tradable_mask
 from utils.position_policy import policy_from_config
+from utils.exposure import overlay_from_config
 tradable = build_tradable_mask(
     data_dict, predictions.index.get_level_values("date").unique())
 policy = policy_from_config(cfg)          # 与 main.py 一样:策略开就跑策略口径
+overlay = overlay_from_config(cfg) if policy is not None else None
 if policy is None:
     signals = pred.generate_signals_from_series(predictions, tradable=tradable)
 else:
@@ -76,6 +78,7 @@ engine = BacktestEngine(
     cost_model=cost,
     lot_size=int(cm.get("lot_size", 100)),
     policy=policy,
+    overlay=overlay,
 )
 result = engine.run(data_dict, signals,
                     benchmark_prices=bm_real if bm_real is not None else bm)
@@ -97,6 +100,22 @@ else:
     lines.append("策略动作: %s | 平均目标仓位 %.1f%% | 平均持仓 %.1f 只 | 期末 %d 只" % (
         ex["policy_actions"], ex["policy_mean_gross_weight"] * 100,
         ex["policy_mean_names"], ex["policy_final_names"]))
+    if overlay is not None and "exposure_mean_cap" in ex:
+        lines.append("暴露层: B 目标波动 %.0f%%/回看 %d 日/缩放地板 %.2f"
+                     " + A RankIC 门控(窗 %d 日、标签 %d 日、≥%d 观测、触发 ×%.2f)"
+                     % (overlay.vol_target_ann * 100, overlay.vol_lookback_days,
+                        overlay.scale_floor, overlay.ic_window_days,
+                        overlay.ic_horizon_days, overlay.ic_min_obs,
+                        overlay.ic_cap_mult))
+        er = ex["exposure"]
+        lines.append("      平均仓位上限 %.1f%% (最低 %.1f%%) | IC 门控触发 %d/%d"
+                     " 次评估 | 全池已实现波动均值 %.1f%%%s" % (
+                         ex["exposure_mean_cap"] * 100, ex["exposure_min_cap"] * 100,
+                         ex["n_gated_evals"], len(er),
+                         er["realized_vol"].mean() * 100,
+                         (" | 窗口 RankIC 均值 %+.4f / 最低 %+.4f"
+                          % (er["rank_ic"].mean(), er["rank_ic"].min())
+                          if er["rank_ic"].notna().any() else "")))
 lines.append("回测区间: %s ~ %s" % (eq.index.min().date(), eq.index.max().date()))
 lines.append("交易日数: %d" % len(eq))
 lines.append("")

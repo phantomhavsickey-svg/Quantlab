@@ -72,8 +72,14 @@ backtest:
 #    classifier → 上涨概率(0~1),阈值必须重设(如 0.55/0.50),否则恒不建仓或恒建仓。
 #    改动任何带位参数后需重新跑回测(walk-forward 预测本身不变,不必重训)。
 position_policy:
-  enabled: false              # false = 沿用 Top-K 等权(已有回测数字不变)
-  buy_score: 0.02             # 建仓线:低于它不建仓
+  enabled: true               # false = 沿用 Top-K 等权(已有回测数字不变)
+  # 三条线由 2026-09-22 的 predictions.parquet 分布反推(python policy_grid.py):
+  # 截面中位数就有 +0.86%,P90=+3.56%,而分数→实际收益从 P40 往上基本是平的,
+  # 所以 buy_score 是"换手/暴露"旋钮而非"alpha"旋钮。注意它挡不住回撤:0.03 线
+  # 日均还有 148 只过线(最差一天 11 只),名额先于分数被占满;要压回撤得压
+  # 总仓位上限(=下面的 exposure_overlay),而不是动分数线
+  # (实测见 README「阈值标定与全档实测」)。
+  buy_score: 0.03             # 建仓线:低于它不建仓
   sell_score: 0.0             # 清仓线:低于它无条件清仓(不补、不锁价格)
   strong_score: 0.05          # 分数高到这儿就给满 max_entry_weight 仓
   step_score_floor: 0.005     # 一档的最小分数步长(防"建仓即触发补仓")
@@ -89,6 +95,33 @@ position_policy:
   max_names: 12               # 同时在市股票数上限
   add_reserve_weight: 0.05    # 给后续补仓留的额度,新仓不许吃光
   trim_price_ttl_days: 60     # "减仓价之上禁止补仓"的有效期(自然日)
+
+# --- 组合级暴露层（A/B）：把上面那个写死的总仓位上限变成按市场状态逐轮生效的值 ---
+# 只改"这一轮允许用多少仓位 + 还让不让建仓",不改分数带状态机本身,所以不需要重训
+# (predictions.parquet 一字不变),但会让 position_policy 口径下的回测数字作废。
+# 基线上限 = position_policy 生效的 max_total_pct(未被 live.risk 覆盖时是 0.95)。
+#   B 目标波动：scale = clip(vol_target_ann / 近 vol_lookback_days 日全池等权已实现
+#     年化波动, scale_floor, 1)，只降不升 —— 低波动时不加杠杆。
+#   A IC 门控：近 ic_window_days 个交易日里**已兑现**(标签走满 ic_horizon_days)的
+#     截面 RankIC 均值 < 0 → 补仓与新仓全部挂起，上限再乘 ic_cap_mult。
+# 两个量都只用信号日收盘及之前的信息，成交在次日开盘，无前视。
+# 2026-09-22 全窗口实测(python policy_grid.py §5，2023-02~2026-09，44 个月度评估)：
+#   无暴露层 Sharpe 0.80/回撤 41.1% → 只开 A 1.10/41.1% → A+B(10%) 1.22/23.2%，
+#   仓位从均值 75% 降到 36%，累计收益 +123%→+122%(成本占比 8.9%→4.3%)。
+# ⚠ 两条诚实的保留意见：(1) A 触发的 7 次全在 2025-08 之后，那 13 个月正是模型
+#   失效段，增益是样本内挑的；(2) 对照档"静态上限 45%"单跑就有 Sharpe 1.09/回撤
+#   24.3%，即 B 相对"直接少下注"的增量只有 +0.13 Sharpe，44 个评估里谈不上显著。
+#   留 B 的理由是它对波动状态自适应(全池波动降到 12% 时它会放开到 79% 上限，
+#   静态档不会)，而不是它在这段样本里更准。
+exposure_overlay:
+  enabled: true
+  vol_target_ann: 0.10        # 0 = 关掉 B
+  vol_lookback_days: 20       # 已实现波动回看交易日数
+  scale_floor: 0.30           # 缩放地板：波动尖峰不许把仓位打到近零
+  ic_window_days: 60          # 0 = 关掉 A
+  ic_horizon_days: 20         # 与 model.horizon 一致，否则门控判的不是这套标签
+  ic_min_obs: 5               # 窗口内已兑现观测太少就不判(避免开局乱关门)
+  ic_cap_mult: 0.50           # 门控触发时上限再乘的系数
 
 # --- 实盘/每日批处理 ---
 live:

@@ -41,6 +41,7 @@ from utils.calendar import is_trading_day, get_month_end_trading_days
 from utils.market_rules import at_limit_down, at_limit_up
 from utils.position_policy import apply_fills, load_states, policy_from_config, \
     save_states
+from utils.exposure import ExposureOverlay, close_panel, overlay_from_config
 from data.cache import CacheManager
 from data.downloader import DataDownloader
 from paper_trade.broker import SimulatedBroker
@@ -130,6 +131,38 @@ def main():
             f" 新仓上限 {policy.max_names} 只,"
             f" 已有状态 {len(states)} 只")
 
+    # ---- 1.5 组合级暴露层（目标波动缩放 + 运行时 IC 门控）----
+    # 与回测引擎同一份实现、同一张收盘宽表:两端算出的仓位上限必须可复现,
+    # 否则"回测里生效、实盘里静默失效"这种洞又会重演一遍。
+    overlay = overlay_from_config(config) if policy is not None else None
+    ovl = None
+    ov = None
+    if overlay is not None:
+        ppath = os.path.join(config["cache"]["directory"], "predictions.parquet")
+        if not os.path.exists(ppath):
+            raise SystemExit(
+                f"exposure_overlay.enabled=true 但 {ppath} 不存在:没有历史分数"
+                f"就判不出 IC 门控,拒绝在门控失真的情况下出指令")
+        hist = pd.read_parquet(ppath)
+        hist["date"] = pd.to_datetime(hist["date"])
+        stale = (today - hist["date"].max().date()).days
+        if stale > 45:
+            logger.warning(f"predictions.parquet 最新日期 {hist['date'].max().date()}"
+                           f" 已落后 {stale} 天:IC 门控会按\"观测不足\"放行,"
+                           f"要让它真的在岗请先重训/补齐预测缓存")
+        closes_src = {}
+        for sym in symbols:
+            d = cache.get_daily(sym)
+            if d is not None and len(d):
+                d = d.copy()
+                d["日期"] = pd.to_datetime(d["日期"])
+                closes_src[sym] = d
+        ovl = ExposureOverlay(hist.set_index(["date", "symbol"])["prediction"],
+                              close_panel(closes_src), overlay)
+        ov = ovl.at(today)
+        logger.info(f"暴露层 @ {today_str}: {ov.note()} → 本轮总仓位上限 "
+                    f"{policy.max_total_pct * ov.cap_mult:.1%}")
+
     gen = DailySignalGenerator(config)
     if policy is not None:
         # 策略模式要全截面分数,不要名单:掉出 Top-K ≠ 跌破清仓线
@@ -201,7 +234,7 @@ def main():
         if policy is not None:
             orders, pol = gen.make_policy_orders(
                 scores, broker.positions, broker.cash, ref_price, states,
-                policy, asof=today)
+                policy, asof=today, ov=ov)
             target = pd.Series({s: w for s, w in pol.weights.items() if w > 0})
             gen.export_target(target, os.path.join(order_dir, f"target_{tag}.csv"))
         else:
@@ -241,7 +274,8 @@ def main():
         before = {str(s): int(q) for s, q in positions.items()}
         if policy is not None:
             orders, pol = gen.make_policy_orders(
-                scores, positions, cash, ref_price, states, policy, asof=today)
+                scores, positions, cash, ref_price, states, policy, asof=today,
+                ov=ov)
             target = pd.Series({s: w for s, w in pol.weights.items() if w > 0})
             gen.export_target(target, os.path.join(order_dir, f"target_{tag}.csv"))
         else:
@@ -268,7 +302,8 @@ def main():
     else:
         if policy is not None:
             orders, pol = gen.make_policy_orders(
-                scores, {}, capital, ref_price, states, policy, asof=today)
+                scores, {}, capital, ref_price, states, policy, asof=today,
+                ov=ov)
             target = pd.Series({s: w for s, w in pol.weights.items() if w > 0})
             gen.export_target(target, os.path.join(order_dir, f"target_{tag}.csv"))
         else:

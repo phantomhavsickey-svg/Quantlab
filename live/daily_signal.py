@@ -27,6 +27,7 @@ from factors.processor import FactorProcessor
 from live.orders import make_orders as _make_orders
 from live.orders import plan_orders as _plan_orders
 from models.trainer import LightGBMTrainer
+from utils.exposure import overlay_args
 from utils.market_rules import build_tradable_mask
 
 
@@ -179,15 +180,19 @@ class DailySignalGenerator:
 
     def make_policy_orders(self, scores: pd.Series, positions: dict,
                            cash: float, ref_price: dict, states: dict,
-                           policy, asof=None):
+                           policy, asof=None, ov=None):
         """分数带位策略版指令(与回测引擎同一个 utils.position_policy.plan)。
+
+        Args:
+            ov: utils.exposure.Overlay 的暴露层结论;None = 纯分数带口径
 
         Returns:
             (orders, PolicyPlan);成交回报到手后调用 apply_fills 推进 states。
         """
         cfg_market = self.config.get("market", {})
         return _plan_orders(scores, positions, cash, ref_price, states, policy,
-                            lot_size=cfg_market.get("lot_size", 100), asof=asof)
+                            lot_size=cfg_market.get("lot_size", 100), asof=asof,
+                            **overlay_args(ov, policy.max_total_pct))
 
     def make_orders(self, weights: pd.Series,
                     positions: dict, cash: float,

@@ -451,7 +451,9 @@ def cmd_backtest(args):
         data_dict,
         feature_matrix.index.get_level_values("date").unique())
     from utils.position_policy import policy_from_config
+    from utils.exposure import overlay_from_config
     policy = policy_from_config(config)
+    overlay = overlay_from_config(config) if policy is not None else None
     if policy is None:
         if trainer is None:
             signals = predictor.generate_signals_from_series(
@@ -487,6 +489,7 @@ def cmd_backtest(args):
         cost_model=cost,
         lot_size=int(cfg_market.get("lot_size", 100)),
         policy=policy,
+        overlay=overlay,
     )
 
     # 基准指数（用于超额对比，下载失败则跳过）
@@ -625,7 +628,11 @@ def cmd_paper_trade(args):
     from utils.market_rules import build_tradable_mask
     from live.orders import make_orders, plan_orders
     from utils.position_policy import apply_fills, policy_from_config
+    from utils.exposure import (ExposureOverlay, close_panel, overlay_args,
+                                overlay_from_config)
     policy = policy_from_config(config)
+    overlay = overlay_from_config(config) if policy is not None else None
+    ovl = None                       # 暴露层实例,all_signals 就位后才构造
     tradable = build_tradable_mask(
         data_dict, feature_matrix.index.get_level_values("date").unique())
     if policy is None:
@@ -645,6 +652,12 @@ def cmd_paper_trade(args):
         preds = predictions if trainer is None else predictor.predict(
             feature_matrix)
         all_signals = scores_from_predictions(preds, tradable=tradable)
+        if overlay is not None:
+            # 与回测引擎同一个暴露层:同一张收盘宽表、同一份全截面分数
+            ovl = ExposureOverlay(all_signals, close_panel(data_dict), overlay)
+            logger.info(f"模拟盘已接入组合级暴露层: 目标波动 "
+                        f"{overlay.vol_target_ann:.0%} / RankIC 门控 "
+                        f"{overlay.ic_window_days} 日窗")
 
     # ---- 按日期模拟真实交易 ----
     all_dates = sorted(factor_panel["date"].unique())
@@ -741,9 +754,11 @@ def cmd_paper_trade(args):
             else:
                 scores = {str(s): float(v) for s, v in day_signals["score"].items()
                           if pd.notna(v)}
+                ov = ovl.at(rebal_ts) if ovl is not None else None
                 orders, pol = plan_orders(
                     scores, broker.positions, broker.cash, ref_price, states,
-                    policy, lot_size=broker.lot_size, asof=exec_date)
+                    policy, lot_size=broker.lot_size, asof=exec_date,
+                    **overlay_args(ov, policy.max_total_pct))
                 pol_pending = (pol.intents, before)
             for o in orders:
                 broker.place_market_order(o["symbol"], o["side"], o["quantity"])
