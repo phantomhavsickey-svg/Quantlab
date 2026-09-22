@@ -86,6 +86,16 @@ class LiveTradingEngine:
         self.symbols = cache.list_cached_symbols()
         logger.info(f"实时交易股票池: {len(self.symbols)} 只")
 
+        # ---- 仓位策略 ----
+        # 本文件是 Top-K 演示链路:调仓量直接来自 generate_signals 的等权权重,
+        # 没有分数带位那套状态机。开了 position_policy 请走 live/run_daily.py。
+        from utils.position_policy import policy_from_config
+        if policy_from_config(config) is not None:
+            logger.warning(
+                "position_policy.enabled=true,但 live_trading.py 只实现 Top-K"
+                "等权调仓;策略链路请用 python live/run_daily.py（每日评估,"
+                "状态存 live/state/policy_state.json）。")
+
         # ---- 状态 ----
         self.last_rebalance_date: date | None = None
         self.running = False

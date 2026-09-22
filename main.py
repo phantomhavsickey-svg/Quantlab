@@ -46,7 +46,7 @@ def cmd_download(args):
     cfg_universe = config["universe"]
 
     cache = CacheManager(config["cache"]["directory"])
-    downloader = DataDownloader(cache)
+    downloader = DataDownloader(cache, **(config.get("download") or {}))
 
     # 获取股票池
     indices = args.universe.split(",") if args.universe else cfg_universe["indices"]
@@ -450,12 +450,26 @@ def cmd_backtest(args):
     tradable = build_tradable_mask(
         data_dict,
         feature_matrix.index.get_level_values("date").unique())
-    if trainer is None:
-        signals = predictor.generate_signals_from_series(
-            predictions, tradable=tradable)
+    from utils.position_policy import policy_from_config
+    policy = policy_from_config(config)
+    if policy is None:
+        if trainer is None:
+            signals = predictor.generate_signals_from_series(
+                predictions, tradable=tradable)
+        else:
+            signals = predictor.generate_signals(feature_matrix,
+                                                 tradable=tradable)
     else:
-        signals = predictor.generate_signals(feature_matrix,
-                                            tradable=tradable)
+        # 策略要的是全截面分数,不是名单;评估频率就是它的补/减仓节奏
+        if cfg_backtest["rebalance_frequency"] == "monthly":
+            logger.warning(
+                "position_policy 已启用但 backtest.rebalance_frequency=monthly:"
+                "月末才评估会把月内的补仓/减仓档位全丢掉,单票 16% 上限也只能"
+                "月末才压得住。建议改成 daily 或 weekly 再对比结果")
+        from models.predictor import scores_from_predictions
+        preds = predictions if trainer is None else predictor.predict(
+            feature_matrix)
+        signals = scores_from_predictions(preds, tradable=tradable)
 
     # 成本模型
     cost = TransactionCostModel(
@@ -471,17 +485,25 @@ def cmd_backtest(args):
         rebalance_frequency=cfg_backtest["rebalance_frequency"],
         max_positions=cfg_backtest["max_positions"],
         cost_model=cost,
+        lot_size=int(cfg_market.get("lot_size", 100)),
+        policy=policy,
     )
 
     # 基准指数（用于超额对比，下载失败则跳过）
     benchmark_curve = None
     try:
-        import akshare as ak
+        from data.downloader import DataDownloader
         bm_code = cfg_backtest.get("benchmark", "000852")
         bm_start = factor_panel["date"].min().strftime("%Y%m%d")
         bm_end = factor_panel["date"].max().strftime("%Y%m%d")
-        bm_df = ak.index_zh_a_hist(symbol=bm_code, period="daily",
-                                   start_date=bm_start, end_date=bm_end)
+        dl = DataDownloader(cache, **(config.get("download") or {}))
+        try:
+            bm_df = dl.download_index_daily(bm_code, bm_start, bm_end)
+        except Exception as e:
+            logger.warning(f"腾讯指数接口失败({e})，改用 akshare 东财")
+            import akshare as ak
+            bm_df = ak.index_zh_a_hist(symbol=bm_code, period="daily",
+                                       start_date=bm_start, end_date=bm_end)
         if bm_df is not None and not bm_df.empty:
             bm_df["日期"] = pd.to_datetime(bm_df["日期"])
             benchmark_curve = bm_df.set_index("日期")["收盘"]
@@ -601,15 +623,28 @@ def cmd_paper_trade(args):
     # ---- 生成全时段信号（信号日已停牌/无成交的股票不占 Top-K 名额）----
     from utils.market_rules import at_limit_down, at_limit_up
     from utils.market_rules import build_tradable_mask
-    from live.orders import make_orders
+    from live.orders import make_orders, plan_orders
+    from utils.position_policy import apply_fills, policy_from_config
+    policy = policy_from_config(config)
     tradable = build_tradable_mask(
         data_dict, feature_matrix.index.get_level_values("date").unique())
-    if trainer is None:
-        all_signals = predictor.generate_signals_from_series(
-            predictions, tradable=tradable)
+    if policy is None:
+        if trainer is None:
+            all_signals = predictor.generate_signals_from_series(
+                predictions, tradable=tradable)
+        else:
+            all_signals = predictor.generate_signals(feature_matrix,
+                                                     tradable=tradable)
     else:
-        all_signals = predictor.generate_signals(feature_matrix,
-                                                tradable=tradable)
+        # 策略模式:全截面分数,持仓由分数带 + 每只股票的状态决定
+        logger.warning(
+            "模拟盘链路的调仓节奏是月末(本函数按 rebalance_dates 循环);"
+            "分数带位策略的月内补/减档在链路上评估不到,要看策略表现请用 "
+            "python main.py backtest。")
+        from models.predictor import scores_from_predictions
+        preds = predictions if trainer is None else predictor.predict(
+            feature_matrix)
+        all_signals = scores_from_predictions(preds, tradable=tradable)
 
     # ---- 按日期模拟真实交易 ----
     all_dates = sorted(factor_panel["date"].unique())
@@ -622,6 +657,9 @@ def cmd_paper_trade(args):
     logger.info(f"模拟盘开始: {args.capital:,.0f} 元, "
                 f"{len(rebalance_dates)} 个调仓日, "
                 f"{len(all_dates)} 个交易日")
+
+    states = {}            # {symbol: NameState} —— 分数带位策略的每票状态
+    pol_pending = None     # 上一轮挂出的 (intents, 下单前持仓快照)
 
     print(f"\n{'='*55}")
     print(f"  QuantLab 模拟盘 (Walk-Forward 仿真)")
@@ -668,6 +706,19 @@ def cmd_paper_trade(args):
         for order in filled:
             journal.log_trade(order)
 
+        # ---- 上一轮挂出的策略意图:按本轮**实际股数变化**提交状态 ----
+        # (本链路把市价单放在下一个 exec_date 撮合,所以提交点也晚一个循环)
+        if pol_pending is not None:
+            intents, p_before = pol_pending
+            fp = {str(o.symbol): float(o.filled_price) for o in filled
+                  if getattr(o, "filled_price", 0.0)}
+            p_after = {str(s): int(p.shares)
+                       for s, p in broker.positions.items()}
+            for s, msg in apply_fills(states, intents, p_before, p_after, fp,
+                                      asof=exec_date).items():
+                logger.debug(f"策略状态 {pd.Timestamp(exec_date).date()} {s}: {msg}")
+            pol_pending = None
+
         # ---- 调仓日：生成信号并下单 ----
         if rebal_ts in all_signals.index.get_level_values("date"):
             try:
@@ -675,16 +726,25 @@ def cmd_paper_trade(args):
             except KeyError:
                 day_signals = all_signals[all_signals.index.get_level_values("date") == rebal_ts]
 
-            target = day_signals[day_signals["weight"] > 0]
-
             # 卖旧买新:下"目标市值 - 现有市值"的差额(与回测共用 utils/sizing)
             ref_price = {s: v["open"] for s, v in market_snapshot.items()
                          if v["open"] > 0}
-            orders = make_orders(
-                dict(target["weight"]), broker.positions, broker.cash,
-                ref_price, lot_size=broker.lot_size,
-                fee_rate_buy=cfg_market["commission_rate"]
-                + cfg_market["slippage_rate"])
+            before = {str(s): int(p.shares)
+                      for s, p in broker.positions.items()}
+            if policy is None:
+                target = day_signals[day_signals["weight"] > 0]
+                orders = make_orders(
+                    dict(target["weight"]), broker.positions, broker.cash,
+                    ref_price, lot_size=broker.lot_size,
+                    fee_rate_buy=cfg_market["commission_rate"]
+                    + cfg_market["slippage_rate"])
+            else:
+                scores = {str(s): float(v) for s, v in day_signals["score"].items()
+                          if pd.notna(v)}
+                orders, pol = plan_orders(
+                    scores, broker.positions, broker.cash, ref_price, states,
+                    policy, lot_size=broker.lot_size, asof=exec_date)
+                pol_pending = (pol.intents, before)
             for o in orders:
                 broker.place_market_order(o["symbol"], o["side"], o["quantity"])
 

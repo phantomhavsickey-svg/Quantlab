@@ -254,6 +254,15 @@ class PortfolioManager:
             调仓报告 dict
         """
         config = self.config
+        # 分数带位策略开启时不能走这条链路:下面的算式是
+        # `current_value / len(target_symbols)` 的等权摊派,既不看建仓线也不看
+        # 单票上限 —— 静默按它下单会把 5% 基准变成 1/N,策略等于没生效。
+        from utils.position_policy import policy_from_config
+        if policy_from_config(config) is not None:
+            raise RuntimeError(
+                "position_policy.enabled=true,portfolio_manager 的调仓是等权摊派,"
+                "不实现分数带位规则。策略链路请走 python live/run_daily.py"
+                "(--simulate / --qmt),策略表现请用 python main.py backtest 评估。")
         if top_k is None:
             top_k = config["backtest"]["max_positions"]
 

@@ -61,7 +61,8 @@ class DailyRunner:
             self.config = yaml.safe_load(f)
 
         self.cache = CacheManager(self.config["cache"]["directory"])
-        self.downloader = DataDownloader(self.cache)
+        self.downloader = DataDownloader(self.cache,
+                                         **(self.config.get("download") or {}))
         self.feed = SinaQuoteFeed()
 
         # 加载模型

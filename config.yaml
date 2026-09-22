@@ -59,9 +59,36 @@ model:
 backtest:
   initial_capital: 1000000    # 初始资金 100万
   rebalance_frequency: "monthly"  # daily / weekly / monthly
-  max_positions: 50           # 最大持仓数
+                                # 启用 position_policy 后这是**策略评估频率**
+  max_positions: 50           # 最大持仓数(策略模式下由 max_names 接管,此项不生效)
   position_sizing: "equal_weight"  # equal_weight / inverse_volatility / signal_strength
   benchmark: "000852"         # 基准指数
+
+# --- 分数带位仓位管理（关闭时=沿用 Top-K 等权，已有回测数字不变）---
+# 建仓线以上才建仓、清仓线以下必清仓；每笔基准 5%、建仓最高 8%、补仓后单票
+# 最高 16%；补/减由"分数相对建仓时的步长 Δ"触发；减仓成交价之上的补仓被禁止。
+# ⚠ buy_score/sell_score 的量纲取决于 model.type:
+#    regressor → 预测 20 日收益率(0.02 = +2%),下面的默认值按此校准;
+#    classifier → 上涨概率(0~1),阈值必须重设(如 0.55/0.50),否则恒不建仓或恒建仓。
+#    改动任何带位参数后需重新跑回测(walk-forward 预测本身不变,不必重训)。
+position_policy:
+  enabled: false              # false = 沿用 Top-K 等权(已有回测数字不变)
+  buy_score: 0.02             # 建仓线:低于它不建仓
+  sell_score: 0.0             # 清仓线:低于它无条件清仓(不补、不锁价格)
+  strong_score: 0.05          # 分数高到这儿就给满 max_entry_weight 仓
+  step_score_floor: 0.005     # 一档的最小分数步长(防"建仓即触发补仓")
+  step_multiplier: 1.0        # Δ = multiplier × (建仓分数 − 建仓线)
+  base_weight: 0.05           # 建仓基准仓位(占总资产)
+  max_entry_weight: 0.08      # 分数很高时的建仓上限
+  max_position_weight: 0.16   # 补仓后的单票上限
+  min_hold_weight: 0.025      # 减仓后的最低仓位,低于它改为清仓(不留碎仓)
+  add_step_weight: 0.05       # 补一档加的仓位
+  trim_step_weight: 0.05      # 减一档降的仓位
+  max_steps_per_eval: 2       # 一次评估最多补/减几档(防单日跳档)
+  min_trade_value: 10000      # 单笔补/减的最小名义额(清仓不受限)
+  max_names: 12               # 同时在市股票数上限
+  add_reserve_weight: 0.05    # 给后续补仓留的额度,新仓不许吃光
+  trim_price_ttl_days: 60     # "减仓价之上禁止补仓"的有效期(自然日)
 
 # --- 实盘/每日批处理 ---
 live:
@@ -72,6 +99,12 @@ live:
   qmt:
     mini_qmt_path: ""         # miniQMT 用户数据目录，如 D:\国金QMT\userdata_mini
     account_id: ""            # 资金账号
+
+# --- 数据下载 ---
+download:
+  max_workers: 8              # 并发线程数（网络型任务，8~16 足够）
+  requests_per_second: 20     # 全局请求速率上限（腾讯/东财共用一个令牌桶）
+  timeout: 20                 # 单次 HTTP 超时（秒）
 
 # --- 缓存 ---
 cache:
