@@ -131,24 +131,24 @@ class PerformanceMetrics:
         return float((daily_returns > 0).mean())
 
     def win_rate_by_trade(self, trades_df: pd.DataFrame) -> float:
-        """按交易订单的胜率（基于买卖价差）。"""
+        """按笔胜率:卖出成交里已实现盈亏(已扣买入成本与双边费用)为正的比例。"""
         if trades_df.empty:
             return 0.0
         # 计算每笔交易的盈亏
         sells = trades_df[trades_df["side"] == "sell"]
         if sells.empty:
             return 0.0
-        return float((sells["net_proceeds"] > 0).mean())
+        return float((sells["realized_pnl"] > 0).mean())
 
     def profit_factor(self, trades_df: pd.DataFrame) -> float:
-        """利润因子 = 总盈利 / 总亏损。"""
+        """利润因子 = 已实现总盈利 / 已实现总亏损。"""
         if trades_df.empty:
             return 0.0
         sells = trades_df[trades_df["side"] == "sell"]
         if sells.empty:
             return 0.0
-        gross_profit = sells[sells["net_proceeds"] > 0]["net_proceeds"].sum()
-        gross_loss = abs(sells[sells["net_proceeds"] < 0]["net_proceeds"].sum())
+        gross_profit = sells[sells["realized_pnl"] > 0]["realized_pnl"].sum()
+        gross_loss = abs(sells[sells["realized_pnl"] < 0]["realized_pnl"].sum())
         if gross_loss == 0:
             return float("inf")
         return float(gross_profit / gross_loss)

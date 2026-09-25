@@ -77,6 +77,29 @@ class TradeJournal:
 
     # ==================== 统计 ====================
 
+    def realized_pnl(self) -> list[float]:
+        """按成交顺序回放持仓均价,给出每一笔卖出的已实现盈亏(含双边费用)。
+
+        trades_log 里的 net_proceeds 只是现金流(卖出毛额 − 卖出费用),不含买入成本;
+        直接拿它当按笔盈亏会把每一笔卖出都记成盈利。
+        """
+        holdings = {}          # {symbol: (股数, 买入成本合计含费)}
+        out = []
+        for t in self.trades_log:
+            shares, basis = holdings.get(t["symbol"], (0, 0))
+            if t["side"] == "buy":
+                holdings[t["symbol"]] = (shares + t["quantity"],
+                                         basis + t["amount"] + t["total_cost"])
+            else:
+                unit_cost = basis / shares
+                out.append(t["amount"] - t["total_cost"] - unit_cost * t["quantity"])
+                left = shares - t["quantity"]
+                if left > 0:
+                    holdings[t["symbol"]] = (left, basis - unit_cost * t["quantity"])
+                else:
+                    holdings.pop(t["symbol"], None)
+        return out
+
     def compute_statistics(self) -> dict:
         """计算交易统计。
 
@@ -92,20 +115,20 @@ class TradeJournal:
         if not sells:
             return {"total_trades": len(self.trades_log)}
 
-        net_proceeds = [s["net_proceeds"] for s in sells]
+        pnl = self.realized_pnl()
 
         return {
             "total_trades": len(self.trades_log),
             "completed_round_trips": len(sells),
-            "win_rate": sum(1 for x in net_proceeds if x > 0) / len(net_proceeds),
-            "avg_pnl_per_trade": np.mean(net_proceeds),
-            "total_pnl": sum(net_proceeds),
-            "best_trade": max(net_proceeds),
-            "worst_trade": min(net_proceeds),
+            "win_rate": sum(1 for x in pnl if x > 0) / len(pnl),
+            "avg_pnl_per_trade": np.mean(pnl),
+            "total_pnl": sum(pnl),
+            "best_trade": max(pnl),
+            "worst_trade": min(pnl),
             "profit_factor": (
-                sum(x for x in net_proceeds if x > 0) /
-                abs(sum(x for x in net_proceeds if x < 0))
-            ) if sum(x for x in net_proceeds if x < 0) != 0 else float("inf"),
+                sum(x for x in pnl if x > 0) /
+                abs(sum(x for x in pnl if x < 0))
+            ) if sum(x for x in pnl if x < 0) != 0 else float("inf"),
             "total_commission": sum(t["commission"] for t in self.trades_log),
             "total_stamp_tax": sum(t["stamp_tax"] for t in self.trades_log),
             "total_slippage": sum(t["slippage"] for t in self.trades_log),

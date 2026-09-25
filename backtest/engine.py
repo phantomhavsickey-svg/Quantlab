@@ -151,6 +151,7 @@ class BacktestEngine:
         # 初始化
         cash = float(self.initial_capital)
         positions = {}        # {symbol: shares}
+        cost_total = {}       # {symbol: 持仓买入成本(含费)} —— 按笔已实现盈亏按均价结转
         entry_date = {}       # {symbol: 建仓交易日} —— 持有期统计用
         locked = {}           # {symbol: 当日买入股数} —— T+1 按股份而不是按票
         last_exec = None      # 上一次撮合日,用于跨日解锁 locked
@@ -283,6 +284,7 @@ class BacktestEngine:
                 sell_price = prices[sym]
                 amount = sell_price * qty
                 cost = self.cost.total_cost(amount, "sell")
+                unit_cost = cost_total[sym] / positions[sym]   # 含买入费的持仓均价
                 cash += amount - cost
                 fill_price[sym] = sell_price
                 if entry_date.get(sym) is not None:
@@ -291,8 +293,10 @@ class BacktestEngine:
                 if qty >= positions[sym]:
                     del positions[sym]
                     entry_date.pop(sym, None)
+                    cost_total.pop(sym, None)
                 else:
                     positions[sym] -= qty
+                    cost_total[sym] -= unit_cost * qty
 
                 all_trades.append({
                     "date": exec_date,
@@ -303,6 +307,7 @@ class BacktestEngine:
                     "amount": amount,
                     "cost": cost,
                     "net_proceeds": amount - cost,
+                    "realized_pnl": amount - cost - unit_cost * qty,
                 })
 
             # --- Step 7: 买入(钱不够时按剩余现金等比缩量,与下单顺序无关) ---
@@ -328,6 +333,7 @@ class BacktestEngine:
 
                 cash -= amount + cost
                 positions[sym] = positions.get(sym, 0) + shares
+                cost_total[sym] = cost_total.get(sym, 0.0) + amount + cost
                 locked[sym] = locked.get(sym, 0) + shares   # T+1:今日买入不可卖
                 fill_price[sym] = buy_price
                 entry_date.setdefault(sym, exec_date)
@@ -342,6 +348,7 @@ class BacktestEngine:
                     "amount": amount,
                     "cost": cost,
                     "net_proceeds": -(amount + cost),
+                    "realized_pnl": 0.0,
                 })
 
             if equity > 0:

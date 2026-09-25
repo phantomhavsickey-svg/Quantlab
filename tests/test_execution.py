@@ -491,3 +491,52 @@ def test_policy_state_commits_only_after_a_real_fill():
     st = states["600001"]
     assert st.ref_score == pytest.approx(0.01)               # 两档一起结清
     assert (st.trim_price, st.trim_date) == (9.6, str(d2.date()))
+
+
+# ==================== 按笔盈亏口径 ====================
+
+def test_trade_win_rate_is_measured_against_cost_not_proceeds():
+    """卖出的 net_proceeds 是现金流(卖额 − 卖出费),不含买入成本。
+
+    A 涨 B 跌、C/D 平价接棒 → 两笔卖出必然一盈一亏。旧实现拿净现金流当盈亏,
+    任何一笔卖出都为正 → 胜率恒 100%、利润因子 inf。
+    """
+    a, b, c, d = "600001", "600002", "600003", "600004"
+    n1 = idx_of(REBAL[1]) + 1                     # 换仓日之前一律 10 元
+    rest = len(DATES) - n1
+    data = {a: daily_frame([10.0] * n1 + [10.0 * 1.02 ** i for i in range(1, rest + 1)]),
+            b: daily_frame([10.0] * n1 + [10.0 * 0.98 ** i for i in range(1, rest + 1)]),
+            c: daily_frame(flat(10.0)), d: daily_frame(flat(10.0))}
+    res = run_bt({REBAL[0]: {a: 0.5, b: 0.5}, REBAL[1]: {c: 0.5, d: 0.5}}, data)
+
+    sells = res["trades"].query("side == 'sell'").set_index("symbol")["realized_pnl"]
+    assert set(sells.index) == {a, b}, sells
+    assert sells[a] > 0 > sells[b], sells
+    m = res["metrics"]
+    assert m["win_rate_by_trade"] == pytest.approx(0.5)
+    assert m["profit_factor"] != float("inf")
+
+
+def test_journal_win_rate_subtracts_the_purchase_cost(tmp_path):
+    from paper_trade.journal import TradeJournal
+
+    def trade(symbol, side, qty, amount, cost):
+        return {"symbol": symbol, "side": side, "quantity": qty, "amount": amount,
+                "commission": cost, "stamp_tax": 0.0, "slippage": 0.0,
+                "total_cost": cost}
+
+    j = TradeJournal(output_dir=str(tmp_path))
+    j.trades_log = [
+        trade("600001", "buy", 100, 1000.0, 5.0),
+        trade("600001", "sell", 100, 900.0, 5.0),        # 亏 110(买入还垫了 5 元费)
+        trade("600002", "buy", 200, 2000.0, 10.0),       # 均价 10.05/股
+        trade("600002", "sell", 100, 1100.0, 10.0),      # 赚 85,余下成本要跟着减
+        trade("600002", "sell", 100, 900.0, 10.0),       # 亏 115
+    ]
+    assert j.realized_pnl() == pytest.approx([-110.0, 85.0, -115.0])
+    st = j.compute_statistics()
+    assert st["win_rate"] == pytest.approx(1 / 3)
+    assert st["total_pnl"] == pytest.approx(-140.0)
+    assert st["profit_factor"] == pytest.approx(85.0 / 225.0)
+
+
