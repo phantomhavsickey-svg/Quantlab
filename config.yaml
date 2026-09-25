@@ -35,7 +35,7 @@ factors:
 # --- 模型 ---
 model:
   type: "regressor"           # regressor（收益率回归）/ classifier（涨跌分类）
-  horizon: 20                 # 预测未来 N 日收益
+  horizon: 5                  # 预测未来 N 日收益
   params:
     objective: "regression"
     metric: "rmse"
@@ -68,20 +68,23 @@ backtest:
 # 建仓线以上才建仓、清仓线以下必清仓；每笔基准 5%、建仓最高 8%、补仓后单票
 # 最高 16%；补/减由"分数相对建仓时的步长 Δ"触发；减仓成交价之上的补仓被禁止。
 # ⚠ buy_score/sell_score 的量纲取决于 model.type:
-#    regressor → 预测 20 日收益率(0.02 = +2%),下面的默认值按此校准;
+#    regressor → 预测 horizon 日收益率(0.02 = +2%),阈值按该 horizon 的分布校准;
 #    classifier → 上涨概率(0~1),阈值必须重设(如 0.55/0.50),否则恒不建仓或恒建仓。
+#    改 model.horizon 会整体缩放分数分布(horizon 5 的 P84=0.0089,horizon 20 是 0.030),
+#    阈值必须按同一分位数重推 —— 旧值直接搬过去等于人人都过建仓线。
 #    改动任何带位参数后需重新跑回测(walk-forward 预测本身不变,不必重训)。
 position_policy:
   enabled: true               # false = 沿用 Top-K 等权(已有回测数字不变)
-  # 三条线由 2026-09-22 的 predictions.parquet 分布反推(python policy_grid.py):
-  # 截面中位数就有 +0.86%,P90=+3.56%,而分数→实际收益从 P40 往上基本是平的,
-  # 所以 buy_score 是"换手/暴露"旋钮而非"alpha"旋钮。注意它挡不住回撤:0.03 线
-  # 日均还有 148 只过线(最差一天 11 只),名额先于分数被占满;要压回撤得压
-  # 总仓位上限(=下面的 exposure_overlay),而不是动分数线
-  # (实测见 README「阈值标定与全档实测」)。
-  buy_score: 0.03             # 建仓线:低于它不建仓
+  # 三条线由 2026-09-25 horizon=5 的 predictions.parquet 按分位数反推(取 P84.42 /
+  # P96.92 —— 与 09-22 那版 20 日默认值同一分位点,重推脚本 python policy_grid.py;
+  # 在现存这份预测上复核:0.00892 = P84.57,0.01794 = P96.95)。
+  # 截面分数中位 +0.25%,买线以上日均 147 只过线(最差一天 2024-12-20 仍剩 24 只),
+  # 强线日均 29 只。所以 buy_score 是"换手/暴露"旋钮而非"alpha"旋钮。注意它挡不住
+  # 回撤:12 个名额先于分数线用满;要压回撤得压总仓位上限(=下面的 exposure_overlay),
+  # 而不是动分数线(实测见 README「阈值标定与全档实测」)。
+  buy_score: 0.00892          # 建仓线:低于它不建仓
   sell_score: 0.0             # 清仓线:低于它无条件清仓(不补、不锁价格)
-  strong_score: 0.05          # 分数高到这儿就给满 max_entry_weight 仓
+  strong_score: 0.01794       # 分数高到这儿就给满 max_entry_weight 仓
   step_score_floor: 0.005     # 一档的最小分数步长(防"建仓即触发补仓")
   step_multiplier: 1.0        # Δ = multiplier × (建仓分数 − 建仓线)
   base_weight: 0.05           # 建仓基准仓位(占总资产)
@@ -119,7 +122,7 @@ exposure_overlay:
   vol_lookback_days: 20       # 已实现波动回看交易日数
   scale_floor: 0.30           # 缩放地板：波动尖峰不许把仓位打到近零
   ic_window_days: 60          # 0 = 关掉 A
-  ic_horizon_days: 20         # 与 model.horizon 一致，否则门控判的不是这套标签
+  ic_horizon_days: 5          # 与 model.horizon 一致，否则门控判的不是这套标签
   ic_min_obs: 5               # 窗口内已兑现观测太少就不判(避免开局乱关门)
   ic_cap_mult: 0.50           # 门控触发时上限再乘的系数
 
