@@ -81,6 +81,21 @@ class TechnicalFactors:
         return turnover.rolling(period).std()
 
     @staticmethod
+    def log_float_cap(close: pd.Series, volume: pd.Series,
+                      turnover: pd.Series) -> pd.Series:
+        """对数流通市值 —— **不是因子，是中性化用的风格变量**。
+
+        换手率是"当日成交量 / 流通股本"，所以 流通股本 = 成交量 / 换手率，
+        再乘当日收盘就是当天真实流通市值。全用当日已知的历史列，不碰任何
+        实时快照，因此没有 `use_spot_data` 那种"今天的快照平铺到历史"的前视。
+        残余偏差来自前复权价（复权因子逐除息日变化），只影响市值的水平刻度、
+        不影响同一天内的排序，而中性化用的是当日截面回归。
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cap = close * volume / turnover.replace(0.0, np.nan)
+        return pd.Series(np.log(cap.where(cap > 0)), index=close.index)
+
+    @staticmethod
     def volume_price_trend(close: pd.Series, volume: pd.Series) -> pd.Series:
         """量价趋势 (VPT) = 累计(涨跌幅 * 成交量)。"""
         pct = close.pct_change()
@@ -216,6 +231,10 @@ class TechnicalFactors:
         # 量价因子
         for p in periods.get("volume_ratio_periods", [5, 20]):
             factors[f"volume_ratio_{p}d"] = cls.volume_ratio(volume, p)
+
+        # 规模风格变量:只在 processing 的中性化那一步用到,处理完即从面板丢掉
+        if not turnover.isna().all():
+            factors["log_float_cap"] = cls.log_float_cap(close, volume, turnover)
 
         if not turnover.isna().all():
             factors["turnover_avg_5d"] = cls.turnover_avg(turnover, 5)

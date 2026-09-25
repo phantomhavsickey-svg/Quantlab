@@ -6,7 +6,6 @@
 import pandas as pd
 import numpy as np
 from loguru import logger
-from sklearn.linear_model import LinearRegression
 
 
 class FactorProcessor:
@@ -18,6 +17,11 @@ class FactorProcessor:
         3. neutralize   — 行业/市值中性化（可选）
         4. lag          — 滞后对齐（防未来函数）
     """
+
+    #: 风格轴，不是因子。无论 neutralize 开不开，都不允许流到特征矩阵里 ——
+    #: 下游十几处 "factor_cols = 除 date/symbol 外的所有列" 会把它当第 26 个
+    #: 特征喂进模型，于是"关掉中性化"和"打开中性化"两组数字比的不再是同一件事。
+    STYLE_COLS = ("log_float_cap", "log_market_cap")
 
     # ==================== 缩尾 ====================
 
@@ -127,7 +131,7 @@ class FactorProcessor:
 
     @staticmethod
     def neutralize(factor: pd.Series, neutralizers: pd.DataFrame) -> pd.Series:
-        """行业/市值中性化。
+        """单截面中性化。
 
         用线性回归残差：factor = β·neutralizers + ε
         返回 ε，即去除 neutralizers 线性影响后的纯 alpha。
@@ -137,20 +141,13 @@ class FactorProcessor:
             neutralizers: 中性化变量 DataFrame（行业哑变量 + log市值）
 
         Returns:
-            中性化后的因子
+            中性化后的因子。缺中性化变量的行保留原值（该列此前已截面标准化，
+            均值本就为 0，退化有限）；因子本身是 NaN 的行仍是 NaN。
         """
-        y = factor.values.reshape(-1, 1)
-        X = neutralizers.values
-
-        # 剔除 NaN
-        valid = ~np.isnan(y.flatten()) & ~np.isnan(X).any(axis=1)
-        if valid.sum() < 10:
-            return factor.copy()
-
-        model = LinearRegression()
-        model.fit(X[valid], y[valid])
-        residuals = y - model.predict(X)
-        return pd.Series(residuals.flatten(), index=factor.index)
+        df = neutralizers.copy()
+        df["_factor_"] = factor.reindex(df.index).to_numpy(dtype=float)
+        return FactorProcessor.neutralize_cross_sectional(
+            df, list(neutralizers.columns))["_factor_"]
 
     @staticmethod
     def neutralize_cross_sectional(factor_df: pd.DataFrame,
@@ -162,27 +159,43 @@ class FactorProcessor:
             neutralizer_cols: 用于中性化的列名列表
 
         Returns:
-            中性化后的 DataFrame
+            中性化后的 DataFrame（中性化变量自身原样保留，剔不剔除由调用方决定）
+
+        实现要点：面板一次转成 numpy，按日切片解最小二乘，最后整体写回。
+        早先的写法是「逐日逐因子调 sklearn，再逐格 df.loc[...]=」，在上百万行
+        的面板上慢到不可用；而且 sklearn ≥1.4 起拒绝含 NaN 的 predict 输入，
+        所以只能把有中性化变量的行单独挑出来拟合。
         """
         result = factor_df.copy()
+        if isinstance(result.index, pd.MultiIndex):
+            dates = np.asarray(result.index.get_level_values("date"))
+        elif "date" in result.columns:
+            dates = np.asarray(result["date"])
+        else:
+            dates = np.zeros(len(result))          # 只有一个截面
+
         factor_cols = [c for c in result.columns
-                       if c not in ["date", "symbol"] + neutralizer_cols]
+                       if c not in ["date", "symbol"] + list(neutralizer_cols)]
+        X_all = np.asarray(result[neutralizer_cols], dtype=float)
+        Y = np.asarray(result[factor_cols], dtype=float).copy()
+        ok_x = ~np.isnan(X_all).any(axis=1)
 
-        if "date" in result.columns:
-            for date, group in result.groupby("date"):
-                neutralizers = group[neutralizer_cols]
-                for fcol in factor_cols:
-                    result.loc[group.index, fcol] = \
-                        FactorProcessor.neutralize(group[fcol], neutralizers)
-        elif isinstance(result.index, pd.MultiIndex):
-            for date in result.index.get_level_values("date").unique():
-                mask = result.index.get_level_values("date") == date
-                group = result.loc[mask]
-                neutralizers = group[neutralizer_cols]
-                for fcol in factor_cols:
-                    result.loc[mask, fcol] = \
-                        FactorProcessor.neutralize(group[fcol], neutralizers)
-
+        codes = pd.factorize(dates)[0]
+        for g in range(int(codes.max()) + 1):
+            rows = np.flatnonzero(codes == g)
+            use = rows[ok_x[rows]]
+            if len(use) < 10:
+                continue
+            A = np.column_stack([np.ones(len(use)), X_all[use]])
+            for j in range(len(factor_cols)):
+                yj = Y[use, j]
+                m = ~np.isnan(yj)
+                if m.sum() < 10:
+                    continue
+                Am, ym = A[m], yj[m]
+                beta = np.linalg.lstsq(Am, ym, rcond=None)[0]
+                Y[use[m], j] = ym - Am @ beta
+        result[factor_cols] = Y
         return result
 
     # ==================== 滞后处理 ====================
@@ -252,13 +265,23 @@ class FactorProcessor:
             neutralizer_cols = proc_config.get("neutralizers",
                                                 ["log_market_cap"])
             available = [c for c in neutralizer_cols if c in result.columns]
-            if available:
-                result = cls.neutralize_cross_sectional(result, available)
-            else:
-                logger.warning("中性化跳过：指定的列不在因子面板中")
+            if not available:
+                # 只 warning 的话,flag 打开了却什么都没发生 —— 这种"静默空转"
+                # 比直接报错坏得多(所有下游数字都按"已中性化"被记录)
+                raise ValueError(
+                    f"neutralize=true 但中性化变量 {neutralizer_cols} 不在面板里;"
+                    f" 现有列 {sorted(result.columns)[:6]}...")
+            result = cls.neutralize_cross_sectional(result, available)
+            logger.info(f"已按 {available} 做截面中性化")
 
         # 4. 滞后
         result = cls.lag_factor_panel(result, periods=1)
+
+        # 5. 风格轴出面板（不管第 3 步跑没跑）
+        style = [c for c in cls.STYLE_COLS if c in result.columns]
+        if style:
+            result = result.drop(columns=style)
+            logger.info(f"已剔除风格变量列 {style}（不是因子，不进特征矩阵）")
 
         logger.info("因子处理完成: 缩尾 → 标准化 → 滞后")
         return result
