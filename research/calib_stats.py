@@ -50,9 +50,13 @@ for q in (50, 84, 90, 94, 96.92, 97, 99):
 
 BUY, STRONG = (float(cfg["position_policy"]["buy_score"]),
                float(cfg["position_policy"]["strong_score"]))
-print("  config: buy_score=%.5f strong_score=%.5f" % (BUY, STRONG))
-print("  在配对口径上的分位: buy=P%.2f  strong=P%.2f"
-      % ((s < BUY).mean() * 100, (s < STRONG).mean() * 100))
+SELL = float(cfg["position_policy"]["sell_score"])
+print("  config: buy_score=%.5f strong_score=%.5f sell_score=%.5f" % (BUY, STRONG, SELL))
+print("  在配对口径上的分位: buy=P%.2f  strong=P%.2f  sell=P%.2f"
+      % ((s < BUY).mean() * 100, (s < STRONG).mean() * 100, (s < SELL).mean() * 100))
+print("  0 分在这套分数上是 P%.2f（负分占比 %.2f%%）—— 清仓线若设成 0，"
+      "等于只允许最前 %.2f%% 的名字留在手里"
+      % ((s < 0.0).mean() * 100, (s < 0.0).mean() * 100, 100 - (s < 0.0).mean() * 100))
 
 print()
 print("### 2. 每日过线只数（12 个新仓名额会不会招不满）")

@@ -138,7 +138,9 @@ def main():
               f"（窗口 {yrs:.2f} 年 → 折年化 {a_live:+.1%} → {a_mix:+.1%}，"
               f"差 {(a_live - a_mix) * 100:.1f}pp/年）")
 
-        # 这批名字本来能不能被本策略买到：中位单笔下单 9.7 万元（README「交易成本口径」）
+        # 这批名字本来能不能被本策略买到：中位单笔下单额取自现行档实测
+        # （`logs/cost_audit_p94.log` §1：单笔中位 113,454 元；09-26 上午那版是 9.7 万）
+        MED_ORDER = 113454
         dead_amt = {}
         dead_pool = CacheManager(CACHE_DEAD)
         for r in g.itertuples():
@@ -156,7 +158,7 @@ def main():
         print(f"  退市组日成交额中位数 {da.median()/1e8:.2f} 亿 vs 在册池 {pool_turn.median()/1e8:.2f} 亿"
               f"（{len(da)} 只有数据）")
         print(f"  退市组里低于在册池 P25({q25/1e8:.2f} 亿)的占 {(da < q25).mean():.0%}"
-              f"，低于中位单笔下单额 9.7 万元的 {(da < 97000).mean():.0%}")
+              f"，低于中位单笔下单额 {MED_ORDER/1e4:.1f} 万元的 {(da < MED_ORDER).mean():.1%}")
     print(f"\n总耗时 {time.time()-t0:.0f}s")
 
 

@@ -83,10 +83,11 @@ df = preds_df.merge(fwd, on=["date", "symbol"]).dropna(subset=["fwd"])
 pct = lambda v: (df.prediction < v).mean()          # 该数值在池中的分位点
 
 print(f"### 1. 分数分布（{H} 日预测收益，样本 {len(df):,}）")
-for q in (.50, .8442, .90, .94, .97, .99):
+for q in (.50, .84, .8442, .90, .94, .97, .99):
     print(f"  P{q*100:.2f} = {df.prediction.quantile(q):+.5f}")
 print(f"  现行建仓线 {base_pol.buy_score:.5f} = P{pct(base_pol.buy_score)*100:.2f}"
-      f" | 现行强线 {base_pol.strong_score:.5f} = P{pct(base_pol.strong_score)*100:.2f}")
+      f" | 现行强线 {base_pol.strong_score:.5f} = P{pct(base_pol.strong_score)*100:.2f}"
+      f" | 现行清仓线 {base_pol.sell_score:.5f} = P{pct(base_pol.sell_score)*100:.2f}")
 
 NEW_BUY = float(df.prediction.quantile(BUY_Q))
 NEW_STRONG = float(df.prediction.quantile(STRONG_Q))
