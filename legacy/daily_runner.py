@@ -1,12 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-每日自动交易流程 — 收盘后自动更新数据 → 算因子 → 出信号 → 模拟下单。
+每日自动交易流程 —— 旧链路（Top-K 等权，已被 live/run_daily.py 取代）。
+
+⚠ 现行默认 position_policy.enabled=true，这条链不实现分数带位规则：它调
+  PortfolioManager.rebalance()，而那里在策略开启时会直接抛错（等权摊派 ≠ 带位）。
+  每日流程请走 python live/run_daily.py（默认只出指令文件，--simulate 才纸面撮合）。
 
 用法:
-    python daily_runner.py                    # 手动运行一次
-    python daily_runner.py --auto             # 自动模式（每天15:30运行）
-    python daily_runner.py --status           # 查看当前持仓和信号
+    python legacy/daily_runner.py                    # 手动运行一次
+    python legacy/daily_runner.py --auto             # 自动模式（每天15:30运行）
+    python legacy/daily_runner.py --status           # 查看当前持仓和信号
 
 工作原理:
     每个交易日:
@@ -40,7 +44,7 @@ from models.predictor import Predictor
 from paper_trade.broker import SimulatedBroker
 from paper_trade.portfolio import PortfolioTracker
 from paper_trade.journal import TradeJournal
-from portfolio_manager import PortfolioManager
+from legacy.portfolio_manager import PortfolioManager
 from live import SinaQuoteFeed
 from utils.logger import setup_logger
 

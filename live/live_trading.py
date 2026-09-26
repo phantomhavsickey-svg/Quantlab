@@ -211,8 +211,7 @@ class LiveTradingEngine:
         orders = make_orders(
             dict(target["weight"]), self.broker.positions, self.broker.cash,
             ref_price, lot_size=self.broker.lot_size,
-            fee_rate_buy=self.broker.commission_rate
-            + self.broker.slippage_rate)
+            cost_fn=self.broker.total_cost)
         for o in orders:
             self.broker.place_market_order(o["symbol"], o["side"],
                                            o["quantity"])

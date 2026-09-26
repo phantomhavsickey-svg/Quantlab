@@ -1,15 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-持仓管理器 — 保存持仓、自动调仓、每日盈亏记录。
+持仓管理器 —— 旧链路（已被 live/run_daily.py 取代，保留仅供翻旧账）。
+
+⚠ position_policy.enabled=true（现行默认）时 rebalance() 直接抛错：它内部的算式是
+  `current_value / len(target)` 的等权摊派，不看建仓线也不看单票上限，静默下单会把
+  5% 基准变成 1/N。策略链路的调仓一律走 python live/run_daily.py。
+  status/pnl 这类只读命令仍可用。
 
 用法:
-    python portfolio_manager.py status        # 查看持仓 + 今日盈亏
-    python portfolio_manager.py rebalance     # 按最新模型信号调仓
-    python portfolio_manager.py pnl           # 查看每日盈亏历史
-    python portfolio_manager.py pnl --days 30 # 最近30天盈亏
-    python portfolio_manager.py pnl --plot    # 生成盈亏曲线HTML
-    python portfolio_manager.py reset         # 重置（重新从上次模拟盘导入）
+    python legacy/portfolio_manager.py status        # 查看持仓 + 今日盈亏
+    python legacy/portfolio_manager.py rebalance     # 按最新模型信号调仓
+    python legacy/portfolio_manager.py pnl           # 查看每日盈亏历史
+    python legacy/portfolio_manager.py pnl --days 30 # 最近30天盈亏
+    python legacy/portfolio_manager.py pnl --plot    # 生成盈亏曲线HTML
+    python legacy/portfolio_manager.py reset         # 重置（重新从上次模拟盘导入）
 
 数据文件:
     portfolio_state.json    # 当前持仓状态 (现金+股票)
@@ -28,7 +33,7 @@ import numpy as np
 import yaml
 from loguru import logger
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))   # 仓库根（本文件在 legacy/ 下）
 
 from data.cache import CacheManager
 from models.trainer import LightGBMTrainer

@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-QuantLab 菜单启动器 — 无需记命令，选数字即可操作。
-双击运行或 python menu.py
+QuantLab 菜单启动器 —— 旧版交互菜单（与 启动.bat 功能重复，已被其取代）。
+
+保留原因：8~11 四项指向 legacy/ 那条 Top-K 等权链路，旧持仓状态还要靠它看。
+现行每日流程请直接用 python live/run_daily.py（不带 --qmt/--confirm 只出文件）。
+
+    python legacy/menu.py
 """
 
 import os
@@ -11,7 +15,7 @@ import subprocess
 from datetime import datetime
 
 PYTHON = sys.executable
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 仓库根
 os.chdir(ROOT)
 
 
@@ -47,7 +51,7 @@ def main():
   |  {datetime.now().strftime('%Y-%m-%d %H:%M')}    {check_data():<30} |
   +======================================================+
   |                                                      |
-  |   1. 下载数据   更新股票日线 (沪深300)               |
+  |   1. 下载数据   更新股票日线 (股票池取 config.yaml)               |
   |   2. 计算因子   技术面+基本面因子                    |
   |   3. 训练模型   LightGBM 机器学习                    |
   |   4. 运行回测   历史回测 + 绩效报告                  |
@@ -70,13 +74,15 @@ def main():
             print("\n  再见!\n")
             break
         elif choice == "1":
-            start = input("  起始日期 [2022-01-01]: ").strip() or "2022-01-01"
-            end = input("  结束日期 [2025-12-31]: ").strip() or "2025-12-31"
-            run(f'"{PYTHON}" main.py download --universe 000300 --start {start} --end {end}')
+            today = datetime.now().strftime("%Y-%m-%d")
+            start = input(f"  起始日期 [2023-01-01]: ").strip() or "2023-01-01"
+            end = input(f"  结束日期 [{today}]: ").strip() or today
+            run(f'"{PYTHON}" main.py download --start {start} --end {end}')
         elif choice == "2":
-            run(f'"{PYTHON}" main.py factors --start 2022-01-01 --end 2025-12-31')
+            run(f'"{PYTHON}" main.py factors --start 2023-01-01 --end '
+                f'{datetime.now().strftime("%Y-%m-%d")}')
         elif choice == "3":
-            run(f'"{PYTHON}" main.py train --train-end 2023-12-31 --test-start 2024-01-01')
+            run(f'"{PYTHON}" main.py train')
         elif choice == "4":
             run(f'"{PYTHON}" main.py backtest --capital 1000000')
         elif choice == "5":
@@ -87,7 +93,7 @@ def main():
                 run(f'"{PYTHON}" live/live_trading.py --demo')
         elif choice == "6":
             print("\n  一键全流程预计耗时 10-20 分钟...\n")
-            run(f'"{PYTHON}" main.py pipeline --universe 000300 --start 2022-01-01 --end 2025-12-31 --capital 1000000')
+            run(f'"{PYTHON}" main.py pipeline --capital 1000000')
         elif choice == "7":
             reports = sorted(
                 [f for f in os.listdir("reports") if f.endswith(".html")]
@@ -101,18 +107,18 @@ def main():
             else:
                 print("\n  未找到报告，请先运行回测\n")
         elif choice == "8":
-            run(f'"{PYTHON}" portfolio_manager.py status')
+            run(f'"{PYTHON}" legacy/portfolio_manager.py status')
         elif choice == "9":
             mode = input("  预览(Y)还是直接执行(N)? [Y/n]: ").strip().lower()
             if mode == "n":
-                run(f'"{PYTHON}" portfolio_manager.py rebalance')
+                run(f'"{PYTHON}" legacy/portfolio_manager.py rebalance')
             else:
-                run(f'"{PYTHON}" portfolio_manager.py rebalance --dry-run')
+                run(f'"{PYTHON}" legacy/portfolio_manager.py rebalance --dry-run')
         elif choice == "10":
             print("\n  生成盈亏曲线图...\n")
-            run(f'"{PYTHON}" portfolio_manager.py pnl --plot')
+            run(f'"{PYTHON}" legacy/portfolio_manager.py pnl --plot')
         elif choice == "11":
-            run(f'"{PYTHON}" daily_runner.py')
+            run(f'"{PYTHON}" legacy/daily_runner.py')
         else:
             print("\n  无效选择，请重试\n")
 

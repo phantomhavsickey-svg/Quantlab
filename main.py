@@ -27,6 +27,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from utils.logger import setup_logger
 from utils.calendar import get_trading_calendar
 
+# 裸命令(`main.py download` / `factors` / `pipeline`,启动.bat 就是这么调的)的日期
+# 默认值。以前写死 2023-01-01~2024-12-31:双击一次就把因子面板重算成 2023~2024 两年,
+# 研究缓存当场被截掉。默认区间现在对齐真实缓存起点,终点取今天。
+DEFAULT_START = "2021-01-01"
+DEFAULT_END = datetime.now().strftime("%Y-%m-%d")
+
 
 def load_config(path: str = "config.yaml") -> dict:
     """加载 YAML 配置。"""
@@ -473,12 +479,13 @@ def cmd_backtest(args):
             feature_matrix)
         signals = scores_from_predictions(preds, tradable=tradable)
 
-    # 成本模型
+    # 成本模型（印花税按 config 的生效日分档取，回测区间跨 2023-08-28 必须分档）
     cost = TransactionCostModel(
         commission_rate=cfg_market["commission_rate"],
         min_commission=cfg_market["min_commission"],
         stamp_tax_rate=cfg_market["stamp_tax_rate"],
         slippage_rate=cfg_market["slippage_rate"],
+        stamp_tax_schedule=cfg_market.get("stamp_tax_schedule"),
     )
 
     # 回测引擎
@@ -749,8 +756,7 @@ def cmd_paper_trade(args):
                 orders = make_orders(
                     dict(target["weight"]), broker.positions, broker.cash,
                     ref_price, lot_size=broker.lot_size,
-                    fee_rate_buy=cfg_market["commission_rate"]
-                    + cfg_market["slippage_rate"])
+                    cost_fn=broker.total_cost)
             else:
                 scores = {str(s): float(v) for s, v in day_signals["score"].items()
                           if pd.notna(v)}
@@ -758,6 +764,7 @@ def cmd_paper_trade(args):
                 orders, pol = plan_orders(
                     scores, broker.positions, broker.cash, ref_price, states,
                     policy, lot_size=broker.lot_size, asof=exec_date,
+                    cost_fn=broker.total_cost,
                     **overlay_args(ov, policy.max_total_pct))
                 pol_pending = (pol.intents, before)
             for o in orders:
@@ -877,11 +884,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python main.py download --universe 000300 --start 2023-01-01 --end 2024-12-31
-  python main.py factors --start 2023-01-01 --end 2024-12-31
-  python main.py train --train-end 2023-12-31 --test-start 2024-01-01
+  python main.py download --universe 000852           # 日期不写 = 2021-01-01 到今天
+  python main.py factors                              # 因子面板重算同一区间
+  python main.py train --min-train-months 24 --retrain-months 6
   python main.py backtest --capital 1000000
-  python main.py pipeline --universe 000300 --start 2020-01-01 --end 2024-12-31
+  python main.py pipeline --start 2021-01-01 --end 2026-09-22
         """
     )
 
@@ -896,13 +903,14 @@ def main():
                        help="指数代码，逗号分隔 (默认: 000852=中证1000)")
     p_dl.add_argument("--symbols", default=None,
                        help="指定股票代码，逗号分隔 (覆盖 --universe)")
-    p_dl.add_argument("--start", default="2023-01-01", help="起始日期")
-    p_dl.add_argument("--end", default="2024-12-31", help="结束日期")
+    p_dl.add_argument("--start", default=DEFAULT_START,
+                      help=f"起始日期 (默认: {DEFAULT_START})")
+    p_dl.add_argument("--end", default=DEFAULT_END, help="结束日期 (默认: 今天)")
 
     # factors
     p_factors = subparsers.add_parser("factors", help="计算因子")
-    p_factors.add_argument("--start", default="2023-01-01")
-    p_factors.add_argument("--end", default="2024-12-31")
+    p_factors.add_argument("--start", default=DEFAULT_START)
+    p_factors.add_argument("--end", default=DEFAULT_END)
 
     # train
     p_train = subparsers.add_parser("train", help="Walk-Forward 滚动训练")
@@ -930,8 +938,8 @@ def main():
     # pipeline
     p_pl = subparsers.add_parser("pipeline", help="一键运行全流程")
     p_pl.add_argument("--universe", default="000852")
-    p_pl.add_argument("--start", default="2021-01-01")
-    p_pl.add_argument("--end", default="2025-12-31")
+    p_pl.add_argument("--start", default=DEFAULT_START)
+    p_pl.add_argument("--end", default=DEFAULT_END)
     p_pl.add_argument("--capital", type=float, default=1_000_000)
 
     args = parser.parse_args()

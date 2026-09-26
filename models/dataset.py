@@ -121,7 +121,7 @@ class DatasetBuilder:
         ).drop(columns=["日期"])
 
         logger.info(f"完整数据集: {len(dataset)} 条 "
-                    f"({len(dataset.columns) - 2} 个特征 + 标签)")
+                    f"({len(dataset.columns) - 3} 个特征 + 标签)")
 
         return dataset
 

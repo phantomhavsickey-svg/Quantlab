@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
-"""临时验证脚本：重算回测真实成本、基准超额与分年度收益。"""
+"""回测口径复核：重算真实成本、基准超额与分年度收益，表写 reports/verify_results.txt。
+
+    python research/verify_backtest.py     # 从任意目录都能跑
+"""
+import os
+import sys
 import warnings
 warnings.filterwarnings("ignore")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)  # config.yaml 与 data/cache 一律按仓库根目录解析
+
 import pandas as pd
 import numpy as np
 import yaml
@@ -48,6 +58,7 @@ cost = TransactionCostModel(
     min_commission=cm["min_commission"],
     stamp_tax_rate=cm["stamp_tax_rate"],
     slippage_rate=cm["slippage_rate"],
+    stamp_tax_schedule=cm.get("stamp_tax_schedule"),
 )
 
 # ---- 基准：1000 只成分股等权指数（直接由已下载数据构造） ----
@@ -151,19 +162,26 @@ else:
     lines.append("=== 基准对比: 下载失败，无法计算 ===")
 lines.append("")
 lines.append("=== 分年度收益 (策略 vs 各基准) ===")
-strat_yearly = eq.groupby(eq.index.year).apply(
-    lambda g: g.iloc[-1] / g.iloc[0] - 1)
+# 口径：日历年总收益 = 年内日收益复利，锚在"上一年最后一个收盘"。这样四行相乘等于全期
+# 累计。旧写法用年内首末收盘价相除，会漏掉每年第一个交易日的跳空（2026 指数因此从 +2.2%
+# 被读成 +0.07%），逐年乘不回去，且和 research/h5_arms.py 的分年列对不上。
+def _yearly(px):
+    r = px.pct_change().dropna()
+    r = r[(r.index >= eq.index.min()) & (r.index <= eq.index.max())]
+    return r.groupby(r.index.year).apply(lambda x: float((1 + x).prod() - 1))
+
+
+strat_yearly = _yearly(eq)
 bms = [("等权组合", bm)] if bm_real is None else \
-      [("中证1000", result.get("benchmark_curve")), ("等权组合", bm)]
-yearly = []
-for name, c in bms:
-    c = c[(c.index >= eq.index.min()) & (c.index <= eq.index.max())]
-    yearly.append((name, c.groupby(c.index.year).apply(
-        lambda g: g.iloc[-1] / g.iloc[0] - 1)))
+      [("中证1000", bm_real), ("等权组合", bm)]
+yearly = [(name, _yearly(c)) for name, c in bms]
 for y in strat_yearly.index:
     seg = " | ".join("%s %+.2f%%" % (n, gy.get(y, np.nan) * 100)
                      for n, gy in yearly)
     lines.append("%d: 策略 %+.2f%% | %s" % (y, strat_yearly[y] * 100, seg))
+lines.append("自检：策略逐年复利 %+.2f%% vs 全期累计 %+.2f%%" % (
+    (float((1 + strat_yearly).prod() - 1)) * 100,
+    m["cumulative_return"] * 100))
 
 # ---- 与 evidence/verify_results.txt(旧引擎、同一子区间)可比的切片 ----
 S, E = pd.Timestamp("2023-02-01"), pd.Timestamp("2025-12-31")
@@ -186,6 +204,7 @@ lines.append("等权组合: " + _seg(bm))
 if bm_real is not None:
     lines.append("中证1000 指数: " + _seg(bm_real))
 
+os.makedirs("reports", exist_ok=True)
 with open("reports/verify_results.txt", "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
 print("done")

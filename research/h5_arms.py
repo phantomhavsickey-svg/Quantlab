@@ -2,14 +2,21 @@
 """现行 horizon=5 预测上的三档对照：Top-50 等权 / 只开带位 / 带位 + 暴露层 A+B。
 
 README 里那张全档实测表是在 horizon=20 的分数上跑的，换标签后要重出这三行才能对齐口径。
-临时脚本。
+
+    python research/h5_arms.py             # 从任意目录都能跑
 """
 import contextlib
 import dataclasses as dc
 import io
+import os
+import sys
 import warnings
 
 warnings.filterwarnings("ignore")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)  # config.yaml 与 data/cache 一律按仓库根目录解析
 
 import numpy as np
 import pandas as pd
@@ -35,15 +42,17 @@ pred = pd.read_parquet("data/cache/predictions.parquet")
 pred["date"] = pd.to_datetime(pred["date"])
 PR = pred.set_index(["date", "symbol"])["prediction"]
 
-BM = DataDownloader(cache, **(cfg.get("download") or {})).download_index_daily(
-    cb.get("benchmark", "000852"), "20210101", "20260825").set_index("日期")["收盘"]
-
 bars = {}
 for s in pred["symbol"].unique():
     df = cache.get_daily(s)
     if df is not None:
         df["日期"] = pd.to_datetime(df["日期"])
         bars[s] = df.sort_values("日期")
+
+# 指数区间跟着行情面板走：写死终点会把分年基准列的最后一个月截掉
+BM_END = max(df["日期"].max() for df in bars.values()).strftime("%Y%m%d")
+BM = DataDownloader(cache, **(cfg.get("download") or {})).download_index_daily(
+    cb.get("benchmark", "000852"), "20210101", BM_END).set_index("日期")["收盘"]
 
 SC = scores_from_predictions(PR, build_tradable_mask(bars, pred["date"].unique()))
 topk = Predictor(None, top_k=cb["max_positions"],
@@ -59,7 +68,8 @@ def run(tag, pol, ovl, sig=None):
                          max_positions=cb["max_positions"],
                          cost_model=TransactionCostModel(
                              cm["commission_rate"], cm["min_commission"],
-                             cm["stamp_tax_rate"], cm["slippage_rate"]),
+                             cm["stamp_tax_rate"], cm["slippage_rate"],
+                             cm.get("stamp_tax_schedule")),
                          lot_size=int(cm.get("lot_size", 100)),
                          policy=pol, overlay=ovl)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -96,8 +106,10 @@ def run(tag, pol, ovl, sig=None):
            pm.max_drawdown(eq)["drawdown"] * 100, len(tr),
            cost / CAP * 100, tail))
     yr = rets.groupby(rets.index.year).apply(lambda x: float((1 + x).prod() - 1))
-    b = BM[BM.index.intersection(rets.index)]
-    byr = b.groupby(b.index.year).apply(lambda g: float(g.iloc[-1] / g.iloc[0] - 1))
+    # 基准与策略同锚：日收益在年内复利，切片用净值曲线的日子（与 verify_backtest 同口径）
+    b = BM.pct_change()
+    b = b[(b.index >= eq.index.min()) & (b.index <= eq.index.max())].dropna()
+    byr = b.groupby(b.index.year).apply(lambda x: float((1 + x).prod() - 1))
     print("  %-22s 分年: %s" % ("", " ".join(
         "%d %+6.1f%%(基准 %+5.1f%%)" % (y, yr[y] * 100, byr.get(y, float("nan")) * 100)
         for y in yr.index)))
@@ -115,5 +127,18 @@ print("horizon=5 现行分数上的三档（100 万本金，月度评估，同�
 run("Top-50 等权（策略关）", None, None, sig=topk)
 run("带位（无暴露层）", pol0, None)
 run("带位 + A+B（现行默认）", pol0, ovl0)
+
+print()
+print("暴露层归因：A/B 各自 vs '直接静态少下注'（同一份分数、同一套费率，只换暴露来源）")
+run("只开 A（IC 门控，不缩波动）", pol0, dc.replace(ovl0, vol_target_ann=0.0))
+run("只开 B（目标波动，无门控）", pol0, dc.replace(ovl0, ic_window_days=0))
+run("静态上限 45%（等于 B 的平均值）", dc.replace(
+    pol0, max_total_pct=0.45, max_names=7), None)
+run("静态上限 30% + 只数 4", dc.replace(
+    pol0, max_total_pct=0.30, max_names=4, add_reserve_weight=0.02), None)
+print()
+print("目标波动 10% 附近扫一遍（同一份分数，A 门控保持开启，只改 vol_target_ann）")
+for tv in (0.08, 0.10, 0.12, 0.15, 0.20):
+    run(f"B 目标波动 {tv:.0%}", pol0, dc.replace(ovl0, vol_target_ann=tv))
 print("  对照：09-22 那版 horizon=20 同一口径 → 等权 +30.95%/0.220，"
       "带位 +123.16%/0.797，A+B +121.60%/1.224")

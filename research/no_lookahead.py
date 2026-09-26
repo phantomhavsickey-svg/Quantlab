@@ -3,14 +3,21 @@
 
 三问：(1) 引擎撮合与盯市；(2) 技术因子；(3) walk-forward 训练标签跨窗口边界。
 对照做法 = 把 T 之后的价格砍掉 / 打到五折，看 T 之前的净值与成交流水是否逐格不变。
-临时脚本。
+
+    python research/no_lookahead.py        # 从任意目录都能跑，结论见 README「回测有没有用未来数据」
 """
 import contextlib
 import io
+import os
 import random
+import sys
 import warnings
 
 warnings.filterwarnings("ignore")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)  # config.yaml 与 data/cache 一律按仓库根目录解析
 
 import numpy as np
 import pandas as pd
@@ -40,15 +47,18 @@ pred = pd.read_parquet("data/cache/predictions.parquet")
 pred["date"] = pd.to_datetime(pred["date"])
 PR = pred.set_index(["date", "symbol"])["prediction"]
 
-BM = DataDownloader(cache, **(cfg.get("download") or {})).download_index_daily(
-    cb.get("benchmark", "000852"), "20210101", "20260825").set_index("日期")["收盘"]
-
 bars_full = {}
 for s in pred["symbol"].unique():
     df = cache.get_daily(s)
     if df is not None:
         df["日期"] = pd.to_datetime(df["日期"])
         bars_full[s] = df.sort_values("日期")
+
+# 指数区间跟着行情面板走（本审计打印的是成交/净值/因子格子，不读基准；终点写死只会留坑）
+BM = DataDownloader(cache, **(cfg.get("download") or {})).download_index_daily(
+    cb.get("benchmark", "000852"), "20210101",
+    max(df["日期"].max() for df in bars_full.values()).strftime("%Y%m%d")
+).set_index("日期")["收盘"]
 
 
 def run(bars, tag):
@@ -57,7 +67,8 @@ def run(bars, tag):
                          max_positions=cb["max_positions"],
                          cost_model=TransactionCostModel(
                              cm["commission_rate"], cm["min_commission"],
-                             cm["stamp_tax_rate"], cm["slippage_rate"]),
+                             cm["stamp_tax_rate"], cm["slippage_rate"],
+                             cm.get("stamp_tax_schedule")),
                          lot_size=int(cm.get("lot_size", 100)),
                          policy=pol, overlay=ocfg)
     with contextlib.redirect_stdout(io.StringIO()):

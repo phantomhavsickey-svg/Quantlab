@@ -2,18 +2,28 @@
 """分数带位策略的阈值标定 + 全档实测（README「阈值标定与全档实测」的表出自这里，
 §5 是组合级暴露层 A/B 的同口径对比）。
 
-    python policy_grid.py
+    python research/policy_grid.py
 
 不改任何生产代码：读 config.yaml 的 position_policy 当基准档，其余档位用
 dataclasses.replace 派生。predictions.parquet 与因子都不重算，重训之后直接重跑
 本脚本即可重新标定。耗时主要在缓存载入（约 1 分钟），每个档位本身几秒。
+
+⚠ 这一版整套是在 horizon=20 的旧分数上跑的（README 已标成"h20 旧表"），且它打印的
+"分年"用的是**年内首末收盘价相除**的旧口径（漏掉每年第一个交易日的跳空）——与
+`verify_backtest.py` / `h5_arms.py` / `fill_and_threshold.py` 现在的"年内日收益复利"
+口径不同，不要跨表比逐年数字。
 """
 import warnings
 warnings.filterwarnings("ignore")
 import contextlib
 import dataclasses as dc
 import io
+import os
 import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)  # config.yaml 与 data/cache 一律按仓库根目录解析
 
 import numpy as np
 import pandas as pd
@@ -30,6 +40,9 @@ from utils.position_policy import policy_from_config
 cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
 cb, cm = cfg["backtest"], cfg["market"]
 CAP = cb.get("initial_capital", 1_000_000)
+# 标签周期必须跟着模型走： predictions.parquet 里的分数预测的是 horizon 日收益,
+# 拿固定的 20 日收益去评它,分位点和分桶表都是在说另一件事。
+H = int(cfg["model"]["horizon"])
 
 preds_df = pd.read_parquet("data/cache/predictions.parquet")
 preds_df["date"] = pd.to_datetime(preds_df["date"])
@@ -61,21 +74,21 @@ if base_pol is None:
 
 closes = pd.DataFrame({s: df.set_index("日期")["收盘"] for s, df in bars.items()})
 closes = closes[~closes.index.duplicated(keep="last")].sort_index()
-fwd = (closes.shift(-20) / closes - 1).stack().rename("fwd").reset_index()
+fwd = (closes.shift(-H) / closes - 1).stack().rename("fwd").reset_index()
 fwd.columns = ["date", "symbol", "fwd"]
 df = preds_df.merge(fwd, on=["date", "symbol"]).dropna(subset=["fwd"])
 df["pct"] = df.groupby("date")["prediction"].rank(ascending=False, method="first") \
     / df.groupby("date")["prediction"].transform("size")
-print("### 1. 分数 = 预测 20 日收益率的截面分布")
+print(f"### 1. 分数 = 预测 {H} 日收益率的截面分布")
 print("  " + "  ".join(f"P{int(q*100)} {df.prediction.quantile(q):+.2%}"
                        for q in (.5, .85, .95, .99))
       + f"  | 均值 {df.prediction.mean():+.2%} σ {df.prediction.std():.2%}"
-      f" | 实际 20 日均益 {df.fwd.mean():+.2%} | 样本 {len(df):,}")
+      f" | 实际 {H} 日均益 {df.fwd.mean():+.2%} | 样本 {len(df):,}")
 lab = ["top1.2%", "1.2-5%", "5-10%", "10-20%", "20-50%", "50-100%"]
 df["b"] = pd.cut(df.pct, [0, .012, .05, .10, .20, .50, 1.0], labels=lab)
 g = df.groupby("b", observed=True).agg(均益=("fwd", "mean"),
                                        胜率=("fwd", lambda x: (x > 0).mean()))
-print("\n按每日分数名次分桶 → 组内实际 20 日收益（头部越平，越说明分数线不是 alpha 旋钮）")
+print(f"\n按每日分数名次分桶 → 组内实际 {H} 日收益（头部越平，越说明分数线不是 alpha 旋钮）")
 print("  " + "  ".join(f"{k} {v.均益:+.2%}/{v.胜率:.0%}" for k, v in g.iterrows()))
 for y, sub in df.groupby(lambda i: df.date[i].year):
     gg = sub.groupby("b", observed=True).fwd.mean()
@@ -104,7 +117,8 @@ def run(label, pol, freq="monthly", top=False, score_df=None, quiet=True,
                          max_positions=cb["max_positions"],
                          cost_model=TransactionCostModel(
                              cm["commission_rate"], cm["min_commission"],
-                             cm["stamp_tax_rate"], cm["slippage_rate"]),
+                             cm["stamp_tax_rate"], cm["slippage_rate"],
+                             cm.get("stamp_tax_schedule")),
                          lot_size=int(cm.get("lot_size", 100)),
                          policy=None if top else pol, overlay=ovl)
     buf = io.StringIO()                      # 引擎自带 print() 摘要，扫档时太吵

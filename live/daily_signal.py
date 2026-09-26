@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from backtest.cost import TransactionCostModel
 from data.cache import CacheManager
 from factors.technical import TechnicalFactors
 from factors.processor import FactorProcessor
@@ -29,6 +30,21 @@ from live.orders import plan_orders as _plan_orders
 from models.trainer import LightGBMTrainer
 from utils.exposure import overlay_args
 from utils.market_rules import build_tradable_mask
+
+
+def buy_cost_fn(market_cfg: dict):
+    """{成交额 → 买入费用},按 config 的 market 块构造 —— 与回测同一个模型。
+
+    只按"佣金+滑点"费率预留资金会漏掉佣金 5 元下限:单子在 1.67 万元以下时实际
+    费用高于费率比例,缩量后会被"现金不足"误挡。
+    """
+    m = market_cfg or {}
+    model = TransactionCostModel(
+        float(m.get("commission_rate", 0.0003)),
+        float(m.get("min_commission", 5.0)),
+        float(m.get("stamp_tax_rate", 0.0005)),
+        float(m.get("slippage_rate", 0.001)))
+    return lambda amount: model.total_cost(amount, "buy")
 
 
 class DailySignalGenerator:
@@ -192,6 +208,7 @@ class DailySignalGenerator:
         cfg_market = self.config.get("market", {})
         return _plan_orders(scores, positions, cash, ref_price, states, policy,
                             lot_size=cfg_market.get("lot_size", 100), asof=asof,
+                            cost_fn=buy_cost_fn(cfg_market),
                             **overlay_args(ov, policy.max_total_pct))
 
     def make_orders(self, weights: pd.Series,
@@ -209,11 +226,9 @@ class DailySignalGenerator:
             [{"symbol", "side", "quantity", "ref_price"}]
         """
         cfg_market = self.config.get("market", {})
-        return _make_orders(
-            weights, positions, cash, ref_price,
-            lot_size=cfg_market.get("lot_size", 100),
-            fee_rate_buy=float(cfg_market.get("commission_rate", 0.0))
-            + float(cfg_market.get("slippage_rate", 0.0)))
+        return _make_orders(weights, positions, cash, ref_price,
+                            lot_size=cfg_market.get("lot_size", 100),
+                            cost_fn=buy_cost_fn(cfg_market))
 
     def export_target(self, weights: pd.Series, path: str):
         """输出目标组合 CSV。"""

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """horizon=5 现行默认档的分数分布/过线只数/分桶实测，供 README 换掉 h20 旧数字。
 
-临时脚本。
+    python research/h5_dist.py             # 从任意目录都能跑
 """
+import os
+import sys
 import warnings
 
 import numpy as np
@@ -10,6 +12,10 @@ import pandas as pd
 import yaml
 
 warnings.filterwarnings("ignore")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)  # config.yaml 与 data/cache 一律按仓库根目录解析
 
 cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
 H = int(cfg["model"]["horizon"])

@@ -1,5 +1,7 @@
 # --- 生成物：全部可由 main.py 重建 ---
 data/cache/
+# 退市股对照面板，由 research/survivorship_probe.py 重下，4.5 MB 可重建
+data/cache_delisted/
 models/saved/
 reports/
 logs/
@@ -7,9 +9,14 @@ signals/
 
 # --- 实盘/模拟盘落盘：真实持仓与委托记录，禁止上传 ---
 live/output/
+live/state/
 portfolio_state.json
 *.token
 .env
+
+# --- 对话/工作记录（单个文件动辄几 MB，不进仓库）---
+*_????-??-??_??-??.md
+*_????-??-??.md
 
 # --- Python ---
 __pycache__/

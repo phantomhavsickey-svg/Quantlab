@@ -52,7 +52,7 @@ def _position_maps(positions: dict, ref_price: dict):
 
 
 def _to_requests(plan, positions, held, prices, cash, lot_size,
-                 fee_rate_buy, intents=None):
+                 fee_rate_buy, intents=None, cost_fn=None):
     """Plan → 指令列表(先卖后买)。给了 intents 就把现金缩量回写进意图。"""
     orders: list[dict] = []
 
@@ -74,7 +74,7 @@ def _to_requests(plan, positions, held, prices, cash, lot_size,
 
     # --- 后买:建仓或加到目标(受可用资金约束) ---
     scale_buys_to_budget(plan, cash + proceeds, prices, lot_size=lot_size,
-                         fee_rate_buy=fee_rate_buy)
+                         fee_rate_buy=fee_rate_buy, cost_fn=cost_fn)
     if intents:
         # 现金缩量是"这一档只能买这么多",按缩量后的股数推进状态。不回写的话,
         # 补仓每轮都被判成未足量成交、参考分数永不推进、仓位反复补到上限。
@@ -91,7 +91,8 @@ def _to_requests(plan, positions, held, prices, cash, lot_size,
 def make_orders(target_weights, positions: dict, cash: float,
                 ref_price: dict, lot_size: int = 100,
                 max_total_pct: float = 1.0,
-                fee_rate_buy: float = 0.0) -> list[dict]:
+                fee_rate_buy: float = 0.0,
+                cost_fn=None) -> list[dict]:
     """从目标权重生成买卖指令(先卖后买,下目标市值与现有市值的差额)。
 
     Args:
@@ -102,8 +103,9 @@ def make_orders(target_weights, positions: dict, cash: float,
         ref_price: {symbol: 参考价}(缺价的股票保留原状,不下单)
         lot_size: 一手股数
         max_total_pct: 投资总额上限
-        fee_rate_buy: 买入单边费率(佣金+滑点);资金不足时按"含费"缩量,
-                      与回测引擎同一条算式
+        fee_rate_buy: 买入单边费率(佣金+滑点),没有 cost_fn 时用它估算
+        cost_fn: {成交额(元) → 费用(元)},通常传 broker.total_cost。
+                 佣金有 5 元下限,传它才能和回测留出同一笔钱
 
     Returns:
         list[dict]: {"symbol","side","quantity","ref_price"},卖出在前、买入在后
@@ -120,7 +122,7 @@ def make_orders(target_weights, positions: dict, cash: float,
     plan = rebalance_plan(target, held, prices, total_value,
                           lot_size=lot_size, max_total_pct=max_total_pct)
     orders = _to_requests(plan, positions, held, prices, cash, lot_size,
-                          fee_rate_buy)
+                          fee_rate_buy, cost_fn=cost_fn)
 
     logger.info(f"指令构造完成: {sum(1 for o in orders if o['side'] == 'sell')} 卖 "
                 f"+ {sum(1 for o in orders if o['side'] == 'buy')} 买 "
@@ -131,7 +133,8 @@ def make_orders(target_weights, positions: dict, cash: float,
 def plan_orders(scores, positions: dict, cash: float, ref_price: dict,
                 states: dict, policy, *, lot_size: int = 100,
                 asof=None, max_total_pct_override: float | None = None,
-                entry_allowed: bool = True) -> tuple[list[dict], object]:
+                entry_allowed: bool = True,
+                cost_fn=None) -> tuple[list[dict], object]:
     """分数带位策略版指令构造(与回测引擎走同一个 utils.position_policy.plan)。
 
     Args:
@@ -143,6 +146,7 @@ def plan_orders(scores, positions: dict, cash: float, ref_price: dict,
         policy: utils.position_policy.PolicyConfig
         max_total_pct_override / entry_allowed: 组合级暴露层(utils/exposure.py)
                 的结果,与回测引擎同一口径;不传 = 纯分数带
+        cost_fn: {成交额(元) → 费用(元)},资金缩量时逐笔预留(同 make_orders)
 
     Returns:
         (orders, PolicyPlan) —— 撮合回报到手后调用
@@ -159,7 +163,7 @@ def plan_orders(scores, positions: dict, cash: float, ref_price: dict,
                       max_total_pct_override=max_total_pct_override,
                       entry_allowed=entry_allowed)
     orders = _to_requests(pol.plan, positions, held, prices, cash, lot_size,
-                          policy.fee_rate_buy, pol.intents)
+                          policy.fee_rate_buy, pol.intents, cost_fn=cost_fn)
     n_names = len([w for w in pol.weights.values() if w > 0])
     cap = (policy.max_total_pct if max_total_pct_override is None
            else min(float(max_total_pct_override), policy.max_total_pct))

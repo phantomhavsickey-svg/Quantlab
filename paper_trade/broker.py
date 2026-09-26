@@ -13,6 +13,8 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 
+from backtest.cost import TransactionCostModel
+
 
 class OrderSide(str, Enum):
     BUY = "buy"
@@ -98,6 +100,10 @@ class SimulatedBroker:
         self.stamp_tax_rate = stamp_tax_rate
         self.slippage_rate = slippage_rate
         self.lot_size = lot_size
+        # 费率只有一份实现:回测的 backtest/cost.py。券商自己再写一遍 max()/0.0005
+        # 迟早会和回测分叉(佣金 5 元下限就分叉过一次 —— 缩量预留按纯费率估会少留钱)。
+        self.cost = TransactionCostModel(commission_rate, min_commission,
+                                        stamp_tax_rate, slippage_rate)
 
         self.positions: dict[str, Position] = {}  # symbol → Position
         self.orders: list[Order] = []
@@ -105,6 +111,14 @@ class SimulatedBroker:
         self.trade_date: date | None = None
 
     # ==================== 下单 ====================
+
+    def total_cost(self, amount: float, side: str = "buy") -> float:
+        """单笔预估费用(元)。
+
+        side 默认 "buy",因为下单前的资金预留(utils/sizing)只问买入那一侧;
+        直接当 cost_fn 传给它就是正确用法。
+        """
+        return self.cost.total_cost(amount, side)
 
     def place_order(self, symbol: str, side: str, quantity: int,
                     order_type: str = "market",
@@ -260,10 +274,9 @@ class SimulatedBroker:
 
             # --- 执行成交 ---
             amount = fill_price * order.quantity
-            commission = max(amount * self.commission_rate, self.min_commission)
-            stamp_tax = amount * self.stamp_tax_rate \
-                if order.side == OrderSide.SELL else 0.0
-            slippage = amount * self.slippage_rate
+            commission = self.cost.commission(amount)
+            stamp_tax = self.cost.stamp_tax(amount, order.side.value)
+            slippage = self.cost.slippage(amount)
             total_cost = commission + stamp_tax + slippage
 
             if order.side == OrderSide.BUY:
@@ -276,8 +289,8 @@ class SimulatedBroker:
                         continue
                     order.quantity = reduced_qty
                     amount = fill_price * order.quantity
-                    commission = max(amount * self.commission_rate, self.min_commission)
-                    slippage = amount * self.slippage_rate
+                    commission = self.cost.commission(amount)
+                    slippage = self.cost.slippage(amount)
                     total_cost = commission + slippage
                     total_deduction = amount + total_cost
                     if total_deduction > self.cash:

@@ -3,8 +3,10 @@
 与 quantlab2/tests/test_execution.py 是同一批断言:两边共用 utils/sizing 与
 utils/market_rules,所以"回测怎么算量、实盘就怎么算量"要在两个仓库里都钉住。
 每条测试只钉一处修复,数据全部合成且刻意把"停牌/缺行/涨跌停/低换手"摆在最
-容易踩到的位置。不需要 lightgbm、不需要真实缓存,所以也不需要重训。
+容易踩到的位置。不需要重训、不需要真实缓存。
 """
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -75,21 +77,27 @@ EXEC_DAYS = [d + pd.offsets.BDay(1) for d in REBAL
              if (d + pd.offsets.BDay(1)) in set(DATES)]
 
 
-def flag_on_exec_days(value):
-    """在每一个成交日上打同一个涨跌幅标记(一字涨停/跌停天天如此)。"""
-    chgs = flat(0.0)
+def gap_on_exec_days(pct, level=10.0):
+    """把每个成交日的**开盘价**打成一个跳空幅度(一字涨停/跌停天天如此)。
+
+    成交判定看"开盘 vs 前收",所以标记必须打在开盘价上;早先版本改的是 `涨跌幅`
+    列(收盘口径),那种数据在旧实现里能触发拦截、在新实现里什么也拦不住。
+    """
+    o = flat(level)
     for d in EXEC_DAYS:
-        chgs[idx_of(d)] = value
-    return chgs
+        o[idx_of(d)] = level * (1 + pct / 100)
+    return o
 
 
-def run_bt(weights_by_date, data, freq="monthly", top_k=None, policy=None):
+def run_bt(weights_by_date, data, freq="monthly", top_k=None, policy=None,
+           cost_model=None):
     sig = signals_from(weights_by_date)
     if top_k is None:
         first = next(iter(weights_by_date.values()))
         top_k = len(first)
     eng = BacktestEngine(initial_capital=CAP, rebalance_frequency=freq,
-                         max_positions=top_k, cost_model=TransactionCostModel(),
+                         max_positions=top_k,
+                         cost_model=cost_model or TransactionCostModel(),
                          policy=policy)
     return eng.run(data, sig)
 
@@ -135,6 +143,144 @@ def test_scale_buys_to_budget_is_order_independent():
     assert sum(q * 10.0 for q in a.buys.values()) * (1 + BUY_FEE) <= 300_000.0
 
 
+# ==================== 交易成本 ====================
+
+STAMP_SCHED = {"1990-01-01": 0.001, "2023-08-28": 0.0005}
+
+
+def test_stamp_tax_rate_follows_effective_date():
+    """回测区间跨 2023-08-28：卖出按成交日取档，早于首档取最早那档，买入恒 0。"""
+    m = TransactionCostModel(stamp_tax_schedule=STAMP_SCHED)
+    assert m.stamp_rate_on("2023-08-27") == 0.001
+    assert m.stamp_rate_on("2023-08-28") == 0.0005
+    assert m.stamp_rate_on("1995-01-01") == 0.001       # 早于全部生效日 → 最早那档
+    assert m.stamp_rate_on(None) == m.stamp_tax_rate    # 不传日期 → 现行档
+    assert m.stamp_tax(100_000, "buy", "2023-06-01") == 0.0
+    assert TransactionCostModel().stamp_rate_on("2023-06-01") == 0.0005  # 不分档
+
+
+def test_total_cost_accounts_the_stamp_tax_cut():
+    """同一笔卖出金额，跨档前后差一整档印花税（不分档就是 2023 上半年少收一半）。"""
+    m = TransactionCostModel(stamp_tax_schedule=STAMP_SCHED)
+    before = m.total_cost(1_000_000, "sell", pd.Timestamp("2023-08-25"))
+    after = m.total_cost(1_000_000, "sell", pd.Timestamp("2023-09-01"))
+    assert round(before - after, 6) == 500.0            # 100 万 × (万十 − 万五)
+    assert m.total_cost(1_000_000, "sell") == after     # 不给日期按现行档
+
+
+def test_scale_buys_to_budget_reserves_the_commission_floor():
+    """佣金 5 元下限：只按费率比例预留会少留钱，逐笔 cost_fn 才不会放行买不下的单。"""
+    prices = {"600001": 10.0, "600002": 10.0}
+    model = TransactionCostModel()                      # 万三/5 元下限 + 万十滑点
+    cap, w = 10_000.0, {"600001": 0.5, "600002": 0.5}  # 权重按归一后的相对目标算
+
+    def real_cost(p):
+        return sum(q * 10.0 + model.total_cost(q * 10.0, "buy")
+                   for q in p.buys.values())
+
+    base = rebalance_plan(w, {}, prices, cap)
+    assert base.buys == {"600001": 500, "600002": 500}
+    assert real_cost(base) == 10_020.0                  # 5,000×2 + (5 元佣金+5 元滑点)×2
+    # 比例估算只有 10,013 元 —— 佣金下限那 5 元/笔没算进去
+    with_fn = rebalance_plan(w, {}, prices, cap)
+    scale_buys_to_budget(with_fn, 10_016.0, prices, fee_rate_buy=BUY_FEE,
+                         cost_fn=lambda a: model.total_cost(a, "buy"))
+    assert real_cost(with_fn) <= 10_016.0
+    without = rebalance_plan(w, {}, prices, cap)
+    scale_buys_to_budget(without, 10_016.0, prices, fee_rate_buy=BUY_FEE)
+    assert real_cost(without) > 10_016.0                # 以为放得下，实际超 4 元
+
+
+def test_paper_orders_reserve_the_same_fee_as_the_backtest():
+    """模拟盘的费率与预留必须和回测同源 —— broker 不再自己写一遍 max()/0.0005。"""
+    from live.orders import make_orders
+    from paper_trade.broker import SimulatedBroker
+
+    br = SimulatedBroker(initial_cash=10_016.0)
+    model = TransactionCostModel(br.commission_rate, br.min_commission,
+                                 br.stamp_tax_rate, br.slippage_rate)
+    for amt in (10_000.0, 5_000.0, 1_000.0):
+        for side in ("buy", "sell"):
+            assert br.total_cost(amt, side) == model.total_cost(amt, side)
+
+    prices = {"600011": 10.0, "600012": 10.0}
+    w = {"600011": 0.5, "600012": 0.5}
+
+    def need(orders):
+        return sum(o["quantity"] * o["ref_price"]
+                   + br.total_cost(o["quantity"] * o["ref_price"], "buy")
+                   for o in orders)
+
+    plain = make_orders(w, {}, br.cash, prices, fee_rate_buy=BUY_FEE)
+    guard = make_orders(w, {}, br.cash, prices, fee_rate_buy=BUY_FEE,
+                        cost_fn=br.total_cost)
+    assert need(plain) > br.cash                     # 只按费率估 → 放行买不下的单
+    assert need(guard) <= br.cash                    # 逐笔预留 → 缩到放得下
+
+
+def test_daily_signal_path_reserves_the_brokers_fee():
+    """每日指令这条路径(实盘与纸交易共用)留的钱要和 broker 收的钱一致。
+
+    费率算式一旦在 live/daily_signal 里退回"佣金+滑点"比例,实盘就会下发回测里
+    买不起的单子。这里不构造 DailySignalGenerator(__init__ 要加载模型),只把
+    make_orders 挂到裸实例上跑一条真实 config。
+    """
+    import yaml
+
+    from live.daily_signal import DailySignalGenerator, buy_cost_fn
+    from paper_trade.broker import SimulatedBroker
+
+    market = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config.yaml")
+        .read_text(encoding="utf-8"))["market"]
+    br = SimulatedBroker(initial_cash=10_016.0,
+                         commission_rate=market["commission_rate"],
+                         min_commission=market["min_commission"],
+                         stamp_tax_rate=market["stamp_tax_rate"],
+                         slippage_rate=market["slippage_rate"])
+    f = buy_cost_fn(market)
+    for amt in (10_000.0, 5_000.0, 1_000.0, 100_000.0):
+        assert f(amt) == br.total_cost(amt, "buy")   # 含 5 元下限那一档
+
+    gen = object.__new__(DailySignalGenerator)
+    gen.config = {"market": market}
+    orders = gen.make_orders(pd.Series({"600011": 0.5, "600012": 0.5}), {},
+                             br.cash, {"600011": 10.0, "600012": 10.0})
+    bought = sum(o["quantity"] * o["ref_price"]
+                 + br.total_cost(o["quantity"] * o["ref_price"], "buy")
+                 for o in orders if o["side"] == "buy")
+    assert bought <= br.cash
+
+
+def test_engine_charges_stamp_tax_of_the_exec_date():
+    """成交日必须传到成本模型:合成数据全在 2023-08-28 之前,卖出该按万十计。
+
+    不比对两档的总成本之差 —— 印花税少收的现金会回灌买入约束,成交量本身就会
+    差一笔。改成逐笔反解税率: cost/amount - 佣金 - 滑点 剩下的就是印花税率,
+    卖出必须正好落在生效档上,买入必须是 0。最低佣金置 0 才反解得干净。
+    """
+    a, b = "600001", "600002"
+    data = {a: daily_frame(flat(10.0)), b: daily_frame(flat(10.0))}
+    sig = {d: ({a: 1.0} if i % 2 == 0 else {b: 1.0}) for i, d in enumerate(REBAL)}
+    flat_res = run_bt(sig, data, cost_model=TransactionCostModel(min_commission=0.0))
+    sched_res = run_bt(sig, data, cost_model=TransactionCostModel(
+        min_commission=0.0, stamp_tax_schedule=STAMP_SCHED))
+
+    def implied_stamp_rate(tr):
+        # 佣金万三 + 滑点千一,双边都收;剩下的差额只可能是印花税
+        return (tr["cost"] / tr["amount"]
+                - 0.0003 - 0.001)
+
+    for res, rate in ((flat_res, 0.0005), (sched_res, 0.001)):
+        tr = res["trades"]
+        sold = tr[tr["side"] == "sell"]
+        assert len(sold) >= 2, "这份流水得有卖出才构成对照"
+        assert sold["date"].max() < pd.Timestamp("2023-08-28")
+        assert np.allclose(implied_stamp_rate(sold), rate, atol=1e-9)
+        assert np.allclose(implied_stamp_rate(tr[tr["side"] == "buy"]),
+                           0.0, atol=1e-9)
+
+
 # ==================== market_rules ====================
 
 def test_limit_pct_by_board():
@@ -150,15 +296,28 @@ def test_limit_pct_by_board():
 
 
 def test_can_fill_blocks_no_bar_zero_volume_and_limit():
-    assert can_fill(None, "600001", "buy")[0] is False
-    assert can_fill(pd.Series({"收盘": 10.0, "成交量": 0.0, "涨跌幅": 0.0}),
-                    "600001", "buy")[0] is False
-    ok, why = can_fill(pd.Series({"收盘": 10.0, "成交量": 1e6, "涨跌幅": 10.0}),
-                       "600001", "sell")
+    assert can_fill(None, "600001", "buy", 10.0)[0] is False
+    assert can_fill(pd.Series({"收盘": 10.0, "开盘": 10.0, "成交量": 0.0}),
+                    "600001", "buy", 10.0)[0] is False
+    ok, why = can_fill(pd.Series({"收盘": 10.0, "开盘": 11.0, "成交量": 1e6}),
+                       "600001", "sell", 10.0)
     assert ok and why == "ok"
-    ok, why = can_fill(pd.Series({"收盘": 10.0, "成交量": 1e6, "涨跌幅": 10.0}),
-                       "600001", "buy")
-    assert not ok and "涨停" in why
+    ok, why = can_fill(pd.Series({"收盘": 10.0, "开盘": 11.0, "成交量": 1e6}),
+                       "600001", "buy", 10.0)
+    assert not ok and "开盘涨停" in why
+
+
+def test_can_fill_judges_the_open_not_the_close():
+    """撮合价是开盘价,涨跌停就必须按开盘判 —— 收盘涨跌幅会放行成交不了的单子。"""
+    row = pd.Series({"收盘": 9.70, "开盘": 9.00, "成交量": 1e6, "涨跌幅": -3.0})
+    assert can_fill(row, "600001", "sell", 10.0)[0] is False    # 开盘 -10%:跌停卖不掉
+    assert can_fill(row, "600001", "buy", 10.0)[0] is True      # 买方向不受影响
+    # 20% 板按 10% 跌幅放行,10% 板按 19.9% 跌幅拦下:幅度取代码前缀
+    assert can_fill(row, "300750", "sell", 10.0)[0] is True
+    row20 = pd.Series({"收盘": 8.0, "开盘": 8.02, "成交量": 1e6, "涨跌幅": -19.8})
+    assert can_fill(row20, "688981", "sell", 10.0)[0] is False
+    # 给不出前收(该股在这一天第一次有 bar)就不猜方向,按不可成交处理
+    assert can_fill(row, "600001", "sell", None)[1] == "无前收盘价"
 
 
 # ==================== tradable 接线 ====================
@@ -229,10 +388,10 @@ def test_low_turnover_rebalance_still_targets_equal_weight():
 def test_limit_up_blocks_the_buy_and_leaves_cash():
     a, b = "600001", "600002"
     data = {a: daily_frame(flat(10.0)),
-            b: daily_frame(flat(10.0), chgs=flag_on_exec_days(10.0))}
+            b: daily_frame(flat(10.0), opens=gap_on_exec_days(10.0))}
     res = run_bt({d: {a: 0.5, b: 0.5} for d in REBAL}, data)
     assert (res["trades"]["symbol"] == b).sum() == 0, "涨停股不该成交"
-    assert res["execution"]["blocked_buy"].get("涨停 +10.00%", 0) >= 1
+    assert res["execution"]["blocked_buy"].get("开盘涨停 +10.00%", 0) >= 1
     tail = res["marks"]
     assert float(tail["cash"].iloc[-1]) > 0.4 * CAP, "买不进的钱要留在现金里"
     assert res["execution"]["n_underinvested_rebalances"] >= 1
@@ -242,16 +401,16 @@ def test_limit_down_keeps_the_position_valued():
     a, b = "600001", "600002"
     exec2 = REBAL[1] + pd.offsets.BDay(1)
     exec3 = REBAL[2] + pd.offsets.BDay(1)
-    chgs = flat(0.0)
-    chgs[idx_of(exec2)] = -10.0
-    data = {a: daily_frame(flat(10.0), chgs=chgs), b: daily_frame(flat(10.0))}
+    opens = flat(10.0)
+    opens[idx_of(exec2)] = 9.0
+    data = {a: daily_frame(flat(10.0), opens=opens), b: daily_frame(flat(10.0))}
     keep, drop = {a: 0.5, b: 0.5}, {b: 1.0}
     res = run_bt({REBAL[0]: keep, REBAL[1]: drop, REBAL[2]: drop}, data)
     tr = res["trades"]
     sold_a = tr[(tr["symbol"] == a) & (tr["side"] == "sell")]
     assert exec2 not in set(sold_a["date"]), "跌停日卖不出去"
     assert set(sold_a["date"]) == {exec3}, "解除跌停后的下一次调仓该卖掉"
-    assert res["execution"]["blocked_sell"].get("跌停 -10.00%") == 1
+    assert res["execution"]["blocked_sell"].get("开盘跌停 -10.00%") == 1
     pos = res["positions"]
     assert (pos["symbol"] == a).sum() > 0, "卖不掉的持仓要继续计在净值里"
 
@@ -381,13 +540,13 @@ def test_policy_blocked_entry_retries_every_round():
     """涨停买不进 → 状态不落地、不留"已建仓"的假记录,下一轮继续重试。"""
     a, b = "600001", "600002"
     data = {a: daily_frame(flat(10.0)),
-            b: daily_frame(flat(10.0), chgs=flag_on_exec_days(10.0))}
+            b: daily_frame(flat(10.0), opens=gap_on_exec_days(10.0))}
     scores = {d: {a: 0.02, b: 0.02} for d in REBAL}
     res = run_bt(scores, data, policy=PolicyConfig())
     tr = res["trades"]
     assert (tr["symbol"] == b).sum() == 0
     assert b not in res["policy_states"] and a in res["policy_states"]
-    assert res["execution"]["blocked_buy"]["涨停 +10.00%"] == len(EXEC_DAYS)
+    assert res["execution"]["blocked_buy"]["开盘涨停 +10.00%"] == len(EXEC_DAYS)
 
 
 def test_policy_entry_budget_is_fee_aware_and_capped():

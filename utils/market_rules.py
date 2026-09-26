@@ -4,10 +4,11 @@ A股交易规则 — 涨跌停幅度、停牌、可成交性、可交易掩码�
 回测与实盘共用这一份判定,避免"回测假设成交、实盘被拒单"两套口径。
 
 口径约定:
-    - 用 `涨跌幅` 列(百分数)判涨跌停,不用价差:前复权改变价格绝对值但
+    - 选股/实盘快照用 `涨跌幅` 列(百分数)判涨跌停,不用价差:前复权改变价格绝对值但
       不改变涨跌幅
+    - `can_fill` 用**开盘价 vs 前收盘**:回测的撮合价就是次日开盘价,判定必须看同一个
+      时点,否则等于用收盘的状态放行一笔开盘根本成交不了的单子
     - 容差 0.5 个百分点,与 Quantlab data/cleaner.py 的识别方式一致
-    - `can_fill` 是**成交时点**的性质(开盘一字涨停买不进、跌停卖不出)
     - `build_tradable_mask` 是**信号时点**的性质(信号日没成交 = 已停牌),
       不含未来信息,用于选股阶段
 """
@@ -17,7 +18,7 @@ from loguru import logger
 
 DATE_COL = "日期"
 CLOSE_COL = "收盘"
-CHG_COL = "涨跌幅"
+OPEN_COL = "开盘"
 VOL_COL = "成交量"
 
 # 板块 → 涨跌停幅度(科创板/创业板 20%,主板 10%)
@@ -65,13 +66,18 @@ def is_suspended(row) -> bool:
     return False
 
 
-def can_fill(row, symbol, side: str) -> tuple[bool, str]:
-    """成交时点可成交性检查。
+def can_fill(row, symbol, side: str, prev_close) -> tuple[bool, str]:
+    """成交时点可成交性检查,按**开盘涨跌幅**(撮合价就是开盘价)。
+
+    旧版文档写的是"开盘一字涨停买不进",代码却用当日 `涨跌幅`(收盘 vs 前收)判定:
+    开盘跌停、收盘拉回 -3% 的那一天,回测按开盘价把卖单成交了,实盘那张单子却排在
+    跌停板上出不去。
 
     Args:
-        row: 当日日线一行(Series/dict),当日无 bar 时传 None
+        row: 成交日日线一行(Series/dict),当日无 bar 时传 None
         symbol: 股票代码,决定涨跌停幅度
         side: "buy" / "sell"
+        prev_close: 该股上一个有效收盘价(复牌股即停牌前最后收盘);给不出就不判方向
 
     Returns:
         (能否成交, 原因)
@@ -80,11 +86,15 @@ def can_fill(row, symbol, side: str) -> tuple[bool, str]:
         return False, "无当日日线"
     if is_suspended(row):
         return False, "停牌/无成交"
-    chg = _get(row, CHG_COL)
+    op = _get(row, OPEN_COL)
+    if (op is None or prev_close is None or pd.isna(op) or pd.isna(prev_close)
+            or float(prev_close) <= 0 or float(op) <= 0):
+        return False, "无前收盘价"
+    chg = (float(op) / float(prev_close) - 1) * 100
     if side == "buy" and at_limit_up(symbol, chg):
-        return False, f"涨停 {float(chg):+.2f}%"
+        return False, f"开盘涨停 {chg:+.2f}%"
     if side == "sell" and at_limit_down(symbol, chg):
-        return False, f"跌停 {float(chg):+.2f}%"
+        return False, f"开盘跌停 {chg:+.2f}%"
     return True, "ok"
 
 

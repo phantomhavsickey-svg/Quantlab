@@ -44,8 +44,6 @@ def _lot(qty: int, lot_size: int) -> int:
 def rebalance_plan(weights: dict, held: dict, prices: dict,
                    total_value: float, *, lot_size: int = 100,
                    max_total_pct: float = 1.0,
-                   fee_rate_buy: float = 0.0,
-                   fee_rate_sell: float = 0.0,
                    normalize: bool = True,
                    keep=None) -> Plan:
     """按目标市值与现有市值的差额生成买卖量。
@@ -58,8 +56,6 @@ def rebalance_plan(weights: dict, held: dict, prices: dict,
         total_value: 调仓时点总资产(现金 + 持仓市值),按同一价格基准
         lot_size: 一手股数
         max_total_pct: 投资总额上限(0.95 = 留 5% 现金缓冲)
-        fee_rate_buy / fee_rate_sell: 单边费率。**当前未被使用**,预算可行性
-                缩放只在 scale_buys_to_budget 里按 fee_rate_buy 算
         normalize: True(默认)= 权重按**比例**分配,Σ权重会被归一化到
                 investable,等权时等价于 1/N —— 旧口径。
                 False = 权重就是**占总资产的绝对比例**,5% 就是 5%,缺席的额度
@@ -115,7 +111,8 @@ def rebalance_plan(weights: dict, held: dict, prices: dict,
 
 def scale_buys_to_budget(plan: Plan, cash: float, prices: dict, *,
                          lot_size: int = 100,
-                         fee_rate_buy: float = 0.0) -> Plan:
+                         fee_rate_buy: float = 0.0,
+                         cost_fn=None) -> Plan:
     """买入总额超过可用资金时按比例缩量(不改变相对权重)。
 
     旧实现是"按 DataFrame 行序买到没钱为止",排在后面的股票被系统性欠配;
@@ -126,12 +123,25 @@ def scale_buys_to_budget(plan: Plan, cash: float, prices: dict, *,
         cash: 可动用资金(实盘=账户可用,回测=卖出回笼后的现金)
         prices: {symbol: 成交价},与 rebalance_plan 同一基准
         lot_size: 一手股数
-        fee_rate_buy: 买入单边费率
+        fee_rate_buy: 买入单边费率(佣金+滑点),没有 cost_fn 时用它估算
+        cost_fn: 逐笔买入费用函数 {成交额(元) → 费用(元)},只问买入那一侧。
+            给了它就用它算预留 ——
+            佣金有 5 元下限,只按费率比例预留会在小单上少留,导致本来买得起的单被
+            "现金不足"误挡(回测里实测 6 笔卖出金额低于 1.67 万元,撞到下限)
+
+    一次等比缩就够:缩量要向下取整到整手,每笔至少少掉一手(千元级),而漏留的
+    佣金下限只有几元,取整的零头远大于它 —— 缩完必然放得下。
     """
     if not plan.buys or cash <= 0:
         return plan
-    cost = sum(q * float(prices[s]) * (1 + fee_rate_buy)
-               for s, q in plan.buys.items())
+
+    def need(shares: dict) -> float:
+        amounts = [q * float(prices[s]) for s, q in shares.items()]
+        if cost_fn is None:
+            return sum(a * (1 + fee_rate_buy) for a in amounts)
+        return sum(a + cost_fn(a) for a in amounts)
+
+    cost = need(plan.buys)
     if cost <= cash:
         return plan
     k = cash / cost

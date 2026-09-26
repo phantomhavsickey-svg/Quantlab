@@ -11,6 +11,8 @@
        日收益/夏普/最大回撤里混进一个月的前视。
     3. 涨停不买、跌停不卖、停牌或当日无 bar 不成交 —— 与实盘共用
        utils/market_rules.py 的判定,不再"回测假设成交、实盘被拒单"。
+       2026-09-26 补一刀:判定改用**开盘涨跌幅**(撮合价就是开盘价)。旧实现用当日
+       收盘涨跌幅,开盘跌停、收盘拉回的日子会被放行按开盘价卖出,实盘做不到。
     4. 持仓股票当日缺 bar 时沿用最近有效收盘估值,市值不再从净值里凭空消失;
        另加显式 T+1:当日买入的股份不可当日卖出。
 """
@@ -116,6 +118,9 @@ class BacktestEngine:
         # 价格面板 + 按日期预索引(旧实现在每个交易日里反复 set_index)
         px = self._index_by_date(data_dict)
         price_df = self._build_price_panel(data_dict)
+        # 涨跌停判定要"开盘 vs 前收"。ffill 让停牌股的前收落到停牌前最后一个收盘,
+        # 与交易所复牌日的除权基准一致;shift(1) 取的是面板上严格前一个交易日。
+        prev_px = price_df.ffill().shift(1)
 
         # 组合级暴露层:构造时一次算完全体 RankIC 与全池等权波动,逐调仓日只切片
         ovl = None
@@ -217,6 +222,7 @@ class BacktestEngine:
                      {s for s, x in scores.items() if x >= self.policy.buy_score})
             universe = cands | set(positions)
             rows = {s: self._row(px, s, exec_date) for s in universe}
+            pc_row = prev_px.loc[exec_date]      # 各名的前收,开盘涨跌幅的分母
             for s in universe:
                 cp = self._close_of(rows[s])
                 if cp is not None:
@@ -277,13 +283,13 @@ class BacktestEngine:
                 qty = min(plan.sells[sym], avail)
                 if qty <= 0:
                     continue
-                ok, why = can_fill(rows.get(sym), sym, "sell")
+                ok, why = can_fill(rows.get(sym), sym, "sell", pc_row.get(sym))
                 if not ok:
                     blocked_sell[why] += 1
                     continue
                 sell_price = prices[sym]
                 amount = sell_price * qty
-                cost = self.cost.total_cost(amount, "sell")
+                cost = self.cost.total_cost(amount, "sell", exec_date)
                 unit_cost = cost_total[sym] / positions[sym]   # 含买入费的持仓均价
                 cash += amount - cost
                 fill_price[sym] = sell_price
@@ -312,15 +318,15 @@ class BacktestEngine:
 
             # --- Step 7: 买入(钱不够时按剩余现金等比缩量,与下单顺序无关) ---
             scale_buys_to_budget(plan, cash, prices, lot_size=self.lot_size,
-                                 fee_rate_buy=self.cost.effective_cost_rate(
-                                     "buy"))
+                                 # 逐笔算预留：佣金有 5 元下限，只按费率比例估会少留钱
+                                 cost_fn=lambda a: self.cost.total_cost(a, "buy"))
             if pol is not None:
                 # 现金缩量是"这一档只能买到这么多",按缩量后的股数推进状态
                 sync_intent_shares(pol.intents, plan)
             traded = 0.0
             for sym in sorted(plan.buys):
                 shares = plan.buys[sym]
-                ok, why = can_fill(rows.get(sym), sym, "buy")
+                ok, why = can_fill(rows.get(sym), sym, "buy", pc_row.get(sym))
                 if not ok:
                     blocked_buy[why] += 1
                     continue
