@@ -165,6 +165,23 @@ print("  单笔金额: 中位 %s 元 | 10 分位 %s | 90 分位 %s | 5 元下限
          format(tr["amount"].quantile(.1), ",.0f"),
          format(tr["amount"].quantile(.9), ",.0f"),
          format(MINCOMM / COMM, ",.0f")))
+# 分项合计：README「交易成本口径」那张表要的数（佣金含下限 / 印花税分档 / 滑点）
+_sell = tr[tr["side"] == "sell"]
+_i_comm = float(np.maximum(tr["amount"] * COMM, MINCOMM).sum())
+_i_comm_floor_only = float((np.maximum(_sell["amount"] * COMM, MINCOMM)
+                            - _sell["amount"] * COMM).sum()
+                           + (np.maximum(tr[tr["side"] == "buy"]["amount"] * COMM, MINCOMM)
+                              - tr[tr["side"] == "buy"]["amount"] * COMM).sum())
+_i_stamp = float((_sell["amount"].to_numpy()
+                  * np.array([stamp_rate(x) for x in _sell["date"]])).sum())
+_i_slip = float((tr["amount"] * SLIP).sum())
+_i_tot = _i_comm + _i_stamp + _i_slip
+print("  分项合计: 佣金(含下限) %s 元 | 印花税(分档) %s 元 | 滑点 %s 元 | 相加 %s 元 = 记入 %s 元"
+      % (format(_i_comm, ",.0f"), format(_i_stamp, ",.0f"), format(_i_slip, ",.0f"),
+         format(_i_tot, ",.0f"), format(tr["cost"].sum(), ",.0f")))
+print("  占总摩擦: 佣金 %.1f%%（其中下限多收 %s 元）印花税 %.1f%% 滑点 %.1f%%"
+      % (_i_comm / _i_tot * 100, format(_i_comm_floor_only, ",.1f"),
+         _i_stamp / _i_tot * 100, _i_slip / _i_tot * 100))
 
 print()
 print("=" * 108)

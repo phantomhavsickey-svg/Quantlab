@@ -5,12 +5,14 @@
 股数算术仍然交给 utils/sizing.py,所以不会重现"回测按目标建仓、实盘按现金
 摊派"那类两端口径分叉。
 
-四条带位(分数 = 模型输出;regressor + mse 口径下是 20 个交易日的预测收益率,
-0.03 = 预期 +3%):
+四条带位(分数 = 模型输出;regressor + mse 口径下是 horizon 个交易日的预测收益率,
+config 现行 horizon=5,0.0135 = 预期 +1.35%):
 
     分数 ≥ 买入线,未持有      建仓。权重在 base_weight ~ max_entry_weight 之间
                               按分数在 [buy_score, strong_score] 上线性插值。
-    分数 ≥ 买入线,已持有      要比"上一次动作的参考分数"再涨够一个步长才补一档,
+    分数 ≥ 买入线,已持有      两条标准**任一满足**就补一档:①比"上一次动作的参考
+                              分数"再涨够一个步长 Δ;②分数够到绝对补仓线
+                              add_score_line(0 = 关闭,只剩①)。
                               补仓后单票市值不超过 max_position_weight。
     卖出线 ≤ 分数 < 买入线    比参考分数跌够一个步长就减仓;减完不足
                               min_hold_weight 时直接清仓(不留一手以下的碎仓)。
@@ -19,6 +21,10 @@
 步长在建仓时冻结:Δ = max(step_score_floor, step_multiplier × (建仓分数 − 买入线))。
 含义是"这只票当初比买入线强多少,往后就要比上次动作再强同样多才值得加一档";
 补仓与减仓共用同一个 Δ,方向相反 —— 这就是"按分数的相对变化触发"。
+另有一条**绝对**补仓线 `add_score_line`:分数够到它就补一档,与 Δ 是"或"的关系。
+它只负责触发,**不消耗台阶、也不推进参考分数** —— 由它促成的补仓不会顺带把减仓
+的基准抬高(减仓条件与 Δ 完全不变)。分数一直待在它上方,就每轮补一档,直到
+`max_position_weight` 上限。
 
 **单子没成交就不推进状态**:最小交易额不够、预算不够、涨停/跌停/停牌没成交、
 只部分成交,一律保留原参考分数。下一轮条件仍然成立,会自动补足差额。否则会出现
@@ -58,6 +64,12 @@ class PolicyConfig:
     strong_score: float = 0.05          # 建仓给到 max_entry_weight 的分数
     step_score_floor: float = 0.005     # 一档的最小分数步长(Δ 下限)
     step_multiplier: float = 1.0        # Δ = multiplier × (建仓分数 − 买入线)
+    # 绝对补仓线(水平条件):分数够到它就补一档,不看台阶。与台阶条件是**"或"**
+    # (任一满足即补),不是"且"。步长是相对条件(比上次动作再涨够 Δ),这条是绝对
+    # 条件(现在还够不够强),两者各管一路;写 0 = 关闭,只剩台阶,即旧行为。
+    # 注意:水平线是**触发**条件,不消耗台阶 —— 由它单独促成的补仓**不**推进
+    # ref_score,所以不会顺带把减仓的参考基准抬高(减仓条件保持原样)。
+    add_score_line: float = 0.0
 
     # --- 仓位带 ---
     base_weight: float = 0.05           # 建仓基准仓位(占总资产)
@@ -121,6 +133,13 @@ class PolicyConfig:
             e.append("strong_score 必须高于 buy_score,否则建仓权重插值除零")
         if self.step_score_floor <= 0 or self.step_multiplier <= 0:
             e.append("step_score_floor / step_multiplier 必须为正,否则补仓条件恒成立")
+        if self.add_score_line < 0:
+            e.append("add_score_line 不能为负(0 = 关闭这条绝对补仓线)")
+        elif 0 < self.add_score_line <= self.buy_score:
+            e.append(f"add_score_line({self.add_score_line}) 不高于 buy_score"
+                     f"({self.buy_score}),等于「凡是分数还在建仓线之上的名字每轮都补"
+                     f"一档」,会一路顶到 max_position_weight —— 要么提到建仓线之上,"
+                     f"要么写 0 关闭")
         if self.max_names <= 0 or self.max_steps_per_eval <= 0:
             e.append("max_names / max_steps_per_eval 必须为正")
         if not 0 < self.max_total_pct <= 1:
@@ -352,19 +371,25 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
                 intents[s] = Intent("cap", s, tgt, -cut, state=st)
             continue
 
-        gate = st.step
-        if x >= st.ref_score + gate - _EPS:
-            n = _steps(x - st.ref_score, gate, cfg.max_steps_per_eval)
+        delta = st.step
+        ladder_up = x >= st.ref_score + delta - _EPS
+        # 绝对补仓线是"或"的另一条腿:够到就补,不管台阶;它不推进 ref_score,
+        # 所以减仓基准完全不受影响。
+        level_up = cfg.add_score_line > 0 and x >= cfg.add_score_line - _EPS
+        if ladder_up or level_up:
+            n = (_steps(x - st.ref_score, delta, cfg.max_steps_per_eval)
+                 if ladder_up else 1)
+            why = "涨够一档" if ladder_up else f"分数 {x:.5f} 达绝对补仓线"
             tgt = min(w0 + n * cfg.add_step_weight, cfg.max_position_weight)
             add = (tgt - w0) * tv
             if tgt <= w0 + _EPS:
                 weights[s] = w0
                 keep.add(s)
-                notes[s] = f"涨够一档,但已在 {cfg.max_position_weight:.0%} 上限,不补"
+                notes[s] = f"{why},但已在 {cfg.max_position_weight:.0%} 上限,不补"
             elif st.trim_price is not None and p > st.trim_price + _EPS:
                 weights[s] = w0
                 keep.add(s)
-                notes[s] = (f"分数涨够一档,但现价 {p:.2f} 高于减仓价 "
+                notes[s] = (f"{why},但现价 {p:.2f} 高于减仓价 "
                             f"{st.trim_price:.2f},禁止补仓")
             elif add < cfg.min_trade_value:
                 weights[s] = w0
@@ -375,17 +400,19 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
                 weights[s] = tgt
                 intents[s] = Intent(
                     "add", s, tgt, add, score=x,
-                    state=replace(st, ref_score=st.ref_score + n * gate,
+                    state=replace(st,
+                                  ref_score=(st.ref_score + n * delta
+                                             if ladder_up else st.ref_score),
                                   adds=st.adds + 1))
-        elif x <= st.ref_score - gate + _EPS:
-            n = _steps(st.ref_score - x, gate, cfg.max_steps_per_eval)
+        elif x <= st.ref_score - delta + _EPS:
+            n = _steps(st.ref_score - x, delta, cfg.max_steps_per_eval)
             tgt = w0 - n * cfg.trim_step_weight
             cut = (w0 - tgt) * tv
             if tgt < cfg.min_hold_weight - _EPS:
                 weights[s] = 0.0
                 intents[s] = Intent(
                     "exit_by_trim", s, 0.0, -w0 * tv,
-                    state=replace(st, ref_score=st.ref_score - n * gate,
+                    state=replace(st, ref_score=st.ref_score - n * delta,
                                   trims=st.trims + 1))
                 notes[s] = (f"减一档只剩 {tgt:.1%} < min_hold_weight "
                             f"{cfg.min_hold_weight:.1%},改为清仓")
@@ -398,7 +425,7 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
                 weights[s] = tgt
                 intents[s] = Intent(
                     "trim", s, tgt, -cut,
-                    state=replace(st, ref_score=st.ref_score - n * gate,
+                    state=replace(st, ref_score=st.ref_score - n * delta,
                                   trims=st.trims + 1))
         else:
             weights[s] = w0          # 带内:不补不减,按现价原样持有
@@ -693,9 +720,9 @@ def load_states(path: str) -> dict:
 
 # ==================== 小工具 ====================
 
-def _steps(moved: float, gate: float, cap: int) -> int:
+def _steps(moved: float, step: float, cap: int) -> int:
     """moved 里含几个完整步长。+1e-9 是防止浮点误差吃掉一整档。"""
-    return min(int(math.floor(moved / gate + 1e-9)), cap)
+    return min(int(math.floor(moved / step + 1e-9)), cap)
 
 
 def _finite(v) -> bool:

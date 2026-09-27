@@ -610,6 +610,50 @@ def test_live_and_backtest_issue_the_same_policy_orders():
     assert set(pol.intents) == set(bt.intents) == {"600001", "600002"}
 
 
+def test_the_level_add_line_reaches_the_live_order_sheet():
+    """补仓第二条标准(绝对线)必须出现在**指令单**上,不只是在 position_policy 里成立。
+
+    分数 0.01850 离台阶还差一点(参考 0.01400 + 一档 0.005 = 0.01900),但已经够到
+    出厂档的绝对线 0.01807 = P97。把这条线关掉,同一份输入就不该有任何买单 ——
+    两半合起来钉住"这一行是绝对线促成的",并且实盘/回测两端算出同一个量。
+    """
+    from dataclasses import replace
+
+    import yaml
+
+    from live.orders import plan_orders
+    from utils.position_policy import NameState
+    from utils.position_policy import plan as policy_plan
+    from utils.position_policy import policy_from_config
+
+    class P:
+        def __init__(self, shares):
+            self.shares, self.available_shares = shares, shares
+            self.market_price = 10.0
+
+    scores = {"600001": 0.01850}
+    prices = {"600001": 10.0}
+    states = {"600001": NameState(entry_score=0.014, ref_score=0.014, step=0.005)}
+    positions = {"600001": P(5000)}
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml")
+                         .read_text(encoding="utf-8"))
+    on = policy_from_config(cfg)             # 出厂 config,绝对线 = 0.01807
+    off = replace(on, add_score_line=0.0)    # 只改这一条,其余一字不动
+    assert on.add_score_line == pytest.approx(0.01807)
+
+    live_orders, pol = plan_orders(scores, positions, 950_000.0, prices,
+                                   dict(states), on, asof=DATES[0])
+    assert pol.intents["600001"].kind == "add"
+    assert [(o["side"], o["symbol"], o["quantity"]) for o in live_orders] == \
+        [("buy", "600001", 5000)]
+    assert policy_plan(scores, {"600001": 5000}, prices, dict(states),
+                       1_000_000.0, on, asof=DATES[0]).plan.buys == {"600001": 5000}
+
+    quiet, _ = plan_orders(scores, positions, 950_000.0, prices,
+                           dict(states), off, asof=DATES[0])
+    assert quiet == []
+
+
 def test_policy_state_commits_only_after_a_real_fill():
     """跌停卖不掉 → 状态不推进;次日成交后按**实际成交价**记减仓价。"""
     from live.orders import plan_orders

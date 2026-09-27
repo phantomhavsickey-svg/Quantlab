@@ -104,10 +104,12 @@ if policy is None:
 else:
     ex = result["execution"]
     lines.append("仓位口径: 分数带位策略(建仓线 %.4f / 清仓线 %.4f / %.0f%%→%.0f%%"
-                 " 建仓 / 单票上限 %.0f%% / 新仓上限 %d 只)" % (
+                 " 建仓 / 单票上限 %.0f%% / 新仓上限 %d 只 / 补仓绝对线 %.4f%s)" % (
                      policy.buy_score, policy.sell_score,
                      policy.base_weight * 100, policy.max_entry_weight * 100,
-                     policy.max_position_weight * 100, policy.max_names))
+                     policy.max_position_weight * 100, policy.max_names,
+                     policy.add_score_line,
+                     "，开" if policy.add_score_line > 0 else "，关"))
     lines.append("策略动作: %s | 平均目标仓位 %.1f%% | 平均持仓 %.1f 只 | 期末 %d 只" % (
         ex["policy_actions"], ex["policy_mean_gross_weight"] * 100,
         ex["policy_mean_names"], ex["policy_final_names"]))

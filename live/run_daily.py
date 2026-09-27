@@ -123,12 +123,15 @@ def main():
     policy_state_file = os.path.join(state_dir, "policy_state.json")
     states = load_states(policy_state_file) if policy else {}
     if policy is not None:
+        level = (f"开(绝对线 {policy.add_score_line:.4f})" if policy.add_score_line > 0
+                 else "关(只按台阶 Δ)")
         logger.info(
             f"仓位策略已启用: 建仓线 {policy.buy_score:.4f} / "
             f"清仓线 {policy.sell_score:.4f} / "
             f"{policy.base_weight:.0%}→{policy.max_entry_weight:.0%} 建仓,"
             f" 单票上限 {policy.max_position_weight:.0%},"
             f" 新仓上限 {policy.max_names} 只,"
+            f" 补仓线 {level},"
             f" 已有状态 {len(states)} 只")
 
     # ---- 1.5 组合级暴露层（目标波动缩放 + 运行时 IC 门控）----

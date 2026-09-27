@@ -108,6 +108,84 @@ def test_position_never_exceeds_the_16pct_cap():
     assert pp.plan.buys == {A: 1000}
 
 
+# ---- 绝对补仓线 add_score_line（0 = 关闭；与台阶 Δ 是"或"，只触发补仓，不碰减仓/清仓）----
+
+def test_add_score_line_of_zero_keeps_the_ladder_only_behaviour():
+    held, states = {A: 5000}, {A: st(entry=0.03)}          # Δ = 0.01
+    assert run(held=held, scores={A: 0.040}, states=states,
+               add_score_line=0.0).plan.buys == {A: 5000}   # 与没有这条线完全一致
+    assert run(held=held, scores={A: 0.035}, states=states,
+               add_score_line=0.0).plan.buys == {}          # 没涨够一档,不补
+
+
+def test_the_level_line_adds_even_when_the_ladder_has_not_been_reached():
+    held, states = {A: 5000}, {A: st(entry=0.03)}          # ref 0.03,Δ 0.01
+    assert run(held=held, scores={A: 0.035}, states=states).plan.buys == {}
+    pp = run(held=held, scores={A: 0.035}, states=states, add_score_line=0.035)
+    assert pp.plan.buys == {A: 5000}                        # 5% → 10%,靠水平线触发
+    assert pp.weights[A] == pytest.approx(0.10)
+
+
+def test_a_level_trigger_does_not_move_the_trim_reference():
+    held, states = {A: 5000}, {A: st(entry=0.03)}          # ref 0.03,Δ 0.01
+    pp = run(held=held, scores={A: 0.035}, states=states, add_score_line=0.035)
+    assert pp.plan.buys == {A: 5000}                        # 台阶差一口气,靠水平线补
+    assert pp.intents[A].state.ref_score == pytest.approx(0.03)   # 台阶基准一字不动
+    assert pp.intents[A].state.adds == 1
+    # 减仓仍按原基准:0.035 → 0.020 = 比 ref 跌够一档
+    down = run(held={A: 10000}, scores={A: 0.020},
+               states={A: pp.intents[A].state}, add_score_line=0.035)
+    assert down.plan.sells == {A: 5000}                     # 10% → 5%,减一档
+    assert down.weights[A] == pytest.approx(0.05)
+
+
+def test_the_level_line_keeps_firing_until_the_16pct_cap():
+    shares, s = 5000, st(entry=0.03)
+    for expect in (10000, 15000, 16000):                    # 5%→10%→15%→16% 封顶
+        pp = run(held={A: shares}, scores={A: 0.035}, states={A: s},
+                 add_score_line=0.035)
+        assert pp.weights[A] == pytest.approx(expect / 100_000)
+        s = pp.intents[A].state
+        shares = expect
+    assert s.ref_score == pytest.approx(0.03)               # 全程没动过台阶基准
+    assert s.adds == 3
+    capped = run(held={A: 16000}, scores={A: 0.035}, states={A: s},
+                 add_score_line=0.035)
+    assert capped.plan.buys == {} and "上限" in capped.notes[A]
+
+
+def test_ladder_and_level_both_fired_still_take_the_ladder_count():
+    held, states = {A: 5000}, {A: st(entry=0.03)}
+    pp = run(held=held, scores={A: 0.065}, states=states, add_score_line=0.035)
+    assert pp.plan.buys == {A: 10000}                       # 台阶算出 2 档,不是一档
+    assert pp.intents[A].state.ref_score == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("bad", [0.02, 0.01, -0.01])
+def test_a_level_line_at_or_below_the_buy_line_is_rejected(bad):
+    with pytest.raises(ValueError, match="add_score_line"):
+        cfg(add_score_line=bad)
+
+
+def test_the_shipped_config_file_feeds_the_level_line_into_the_policy():
+    """旋钮改过名(gate → line)。最怕的就是 config.yaml 里的键和字段名分叉 ——
+    那样这条线会静默失效,回测/实盘都读不到它。from_dict 对未知键报错,所以只要
+    键名对不上,这里就会红。"""
+    from pathlib import Path
+
+    import yaml
+
+    from utils.position_policy import policy_from_config
+    raw = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml")
+                         .read_text(encoding="utf-8"))
+    assert "add_score_line" in raw["position_policy"]
+    pol = policy_from_config(raw)
+    assert pol.add_score_line == float(raw["position_policy"]["add_score_line"])
+    # 2026-09-27 起出厂档把这条线开在 P97(= 强档线同一个分位),补仓 = 台阶 或 绝对线
+    assert pol.add_score_line == pytest.approx(0.01807)
+    assert pol.add_score_line == pol.strong_score
+
+
 def test_add_blocked_by_budget_is_not_committed_and_retries_next_round():
     # 12 只已持满 60%,再补一档要 5% → 剩余额度 0.95−0.60 = 0.35,够;
     # 换成总仓位几乎打满的情形:18 只 × 5% = 0.90,再加一档就破 0.95
