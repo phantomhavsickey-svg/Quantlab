@@ -173,6 +173,22 @@ def cmd_factors(args):
     processor = FactorProcessor()
     processed = processor.process(factor_panel, cfg_factors)
 
+    # --- 市场模式因子(全池同值,不能吃截面缩尾/标准化,必须在 process 之后并入) ---
+    from factors.market_regime import MARKET_COLS, compute_market_regime
+    market = compute_market_regime(data_dict)
+    n_before = len(processed)
+    processed = processed.merge(market, on="date", how="left")
+    if len(processed) != n_before:
+        raise RuntimeError("市场模式因子并入后行数变了,merge 键有重复")
+    # 不变式:除面板首日(shift 之后没有更早的行)外不许有 NaN,否则
+    # dataset.dropna() 会多丢行、walk-forward 窗口整体平移,对照作废
+    late_nan = int(processed.loc[processed["date"] > processed["date"].min(),
+                                 list(MARKET_COLS)].isna().any(axis=1).sum())
+    if late_nan:
+        raise RuntimeError(f"市场模式因子在非首日出现 NaN {late_nan} 行,会改变 dropna 口径")
+    logger.info(f"市场模式因子已并入: {len(MARKET_COLS)} 列 "
+                f"(首日 NaN 行 {int(processed[list(MARKET_COLS)].isna().any(axis=1).sum())})")
+
     # 保存
     os.makedirs("data/cache", exist_ok=True)
     processed.to_parquet("data/cache/factor_panel.parquet", index=False)
@@ -195,8 +211,9 @@ def cmd_factors(args):
 
     # 评估
     evaluator = FactorEvaluator()
+    # 市场模式列每日截面上是常数,算不了截面 IC,不进因子评估表
     factor_cols = [c for c in processed.columns
-                   if c not in ["date", "symbol"]]
+                   if c not in ["date", "symbol"] and c not in MARKET_COLS]
     factor_panel_indexed = processed.set_index(["date", "symbol"])[factor_cols]
 
     # 只评估有 forward_return 对齐的日期
